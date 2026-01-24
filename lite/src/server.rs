@@ -15,7 +15,7 @@ use tower_http::{
 };
 use tracing::info;
 
-use crate::{backend::Backend, handlers, init};
+use crate::{auth, backend::Backend, handlers, init};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct TlsConfig {
@@ -69,6 +69,10 @@ pub struct LiteArgs {
     #[arg(long)]
     pub no_cors: bool,
 
+    /// Maximum in-flight append metered bytes across all streams before admission blocks.
+    #[arg(long, default_value = "128MiB")]
+    pub append_inflight_bytes: ByteSize,
+
     /// Path to a JSON file defining basins and streams to create at startup.
     ///
     /// Uses create-or-reconfigure semantics, so it is safe to run on repeated
@@ -76,9 +80,21 @@ pub struct LiteArgs {
     #[arg(long, env = "S2LITE_INIT_FILE")]
     pub init_file: Option<PathBuf>,
 
-    /// Maximum in-flight append metered bytes across all streams before admission blocks.
-    #[arg(long, default_value = "128MiB")]
-    pub append_inflight_bytes: ByteSize,
+    /// Bearer token for metrics endpoints.
+    /// If set, metrics endpoints require "Authorization: Bearer <token>".
+    /// If not set, metrics endpoints are publicly accessible.
+    #[arg(long, env = "S2_METRICS_TOKEN")]
+    pub metrics_token: Option<String>,
+
+    /// Root key for signing access tokens (base58-encoded P-256 private key).
+    /// If not set, authentication is disabled.
+    #[arg(long, env = "S2_ROOT_KEY")]
+    pub root_key: Option<String>,
+
+    /// Signature timestamp window in seconds (default 300).
+    /// Requests with signatures older than this are rejected.
+    #[arg(long, env = "S2_SIGNATURE_WINDOW", default_value = "300")]
+    pub signature_window: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +168,41 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
         init::apply(&backend, spec).await?;
     }
 
-    let mut app = handlers::router().with_state(backend).layer(
+    // Parse and validate root key for auth
+    let root_key = args
+        .root_key
+        .as_ref()
+        .map(|k| auth::RootKey::from_base58(k))
+        .transpose()
+        .map_err(|e| eyre::eyre!("invalid root key: {}", e))?;
+
+    if let Some(ref key) = root_key {
+        info!(public_key = %key.public_key(), "auth enabled");
+    } else {
+        info!("auth disabled (no root key provided)");
+    }
+
+    // Create auth state
+    let auth_state = match root_key {
+        Some(key) => auth::AuthState::new(key, args.signature_window, args.metrics_token.clone()),
+        None => match args.metrics_token {
+            Some(token) => auth::AuthState::metrics_only(token),
+            None => auth::AuthState::disabled(),
+        },
+    };
+
+    if auth_state.metrics_token().is_some() {
+        info!("metrics auth enabled");
+    } else {
+        info!("metrics endpoints are publicly accessible");
+    }
+
+    let app_state = handlers::v1::AppState {
+        backend,
+        auth: auth_state,
+    };
+
+    let mut app = handlers::router(&app_state).with_state(app_state).layer(
         TraceLayer::new_for_http()
             .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
             .on_request(DefaultOnRequest::new().level(tracing::Level::DEBUG))

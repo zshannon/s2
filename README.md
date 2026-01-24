@@ -144,6 +144,41 @@ nc starwars.s2.dev 23 | s2 append s2://liteness/starwars
 
 ![S2 Star Wars Streaming](./assets/starwars.gif)
 
+### Authentication
+
+s2-lite supports optional authentication using [Biscuit tokens](https://biscuitsec.org/) with [RFC 9421 HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html).
+
+To enable authentication, provide a P-256 root key:
+
+```bash
+# Generate a root key (P-256 private key, base58 encoded)
+openssl ecparam -name prime256v1 -genkey -noout | \
+  openssl ec -no_public -outform DER 2>/dev/null | tail -c 32 | base58
+
+# Start with authentication enabled
+docker run -p 8080:80 \
+  -e S2_ROOT_KEY="<your-base58-root-key>" \
+  ghcr.io/s2-streamstore/s2-lite
+```
+
+When auth is enabled:
+- All API requests require a Biscuit token (`Authorization: Bearer <token>`)
+- All API requests must be signed per RFC 9421
+- Token scopes control access to basins, streams, and operations
+
+<details>
+<summary>Configuration options</summary>
+
+| Environment Variable | CLI Argument | Default | Description |
+|---------------------|--------------|---------|-------------|
+| `S2_ROOT_KEY` | `--root-key` | (none) | Base58 P-256 private key for token signing. Auth disabled if not set. |
+| `S2_SIGNATURE_WINDOW` | `--signature-window` | `300` | Max age of request signatures in seconds |
+| `S2_METRICS_TOKEN` | `--metrics-token` | (none) | Simple Bearer token for metrics endpoints |
+
+</details>
+
+See [Authentication Documentation](lite/docs/authentication.md) for complete details on token issuance, scopes, delegation, and revocation.
+
 ### Kubernetes Deployment
 
 Deploy `s2-lite` to Kubernetes using Helm. See the [Helm chart documentation](charts/s2-lite-helm/README.md) for installation instructions and configuration options.
@@ -199,5 +234,5 @@ Complete [specs](https://github.com/s2-streamstore/s2-specs/tree/main/s2/v1) are
 | `/basins` | Supported |
 | `/streams` | Supported |
 | `/streams/{stream}/records` | Supported |
-| `/access-tokens` | Not supported https://github.com/s2-streamstore/s2/issues/28 |
+| `/access-tokens` | Supported (issue, revoke) |
 | `/metrics` | Not supported |

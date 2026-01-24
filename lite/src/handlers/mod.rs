@@ -8,12 +8,12 @@ use axum::{
 
 use crate::backend::Backend;
 
-pub fn router() -> axum::Router<Backend> {
+pub fn router(app_state: &v1::AppState) -> axum::Router<v1::AppState> {
     axum::Router::new()
         .route(/* bw compat */ "/ping", axum::routing::get(health))
         .route("/health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(metrics))
-        .nest("/v1", v1::router())
+        .nest("/v1", v1::router(app_state))
 }
 
 async fn health(State(backend): State<Backend>) -> Response {

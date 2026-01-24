@@ -73,4 +73,5 @@ sha2 = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true, features = ["v4"] }
