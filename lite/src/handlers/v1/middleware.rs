@@ -79,16 +79,19 @@ pub async fn auth_middleware(
         .get::<OriginalUri>()
         .map(|uri| uri.path().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
+    // Prefer Host header over URI authority for signature verification.
+    // Behind reverse proxies (like Fly.io), URI authority contains the internal
+    // address, but clients sign with the public hostname from the Host header.
     let authority = request
-        .uri()
-        .authority()
-        .map(|a| a.to_string())
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(String::from)
         .or_else(|| {
             request
-                .headers()
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .map(String::from)
+                .uri()
+                .authority()
+                .map(|a| a.to_string())
         })
         .unwrap_or_default();
     // Normalize authority: remove default port (:443 for HTTPS, :80 for HTTP)

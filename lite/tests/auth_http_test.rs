@@ -1927,3 +1927,165 @@ async fn test_authority_normalization_preserves_nondefault_port() {
         response_str
     );
 }
+
+/// Test that server uses Host header (not URI authority) for signature verification.
+///
+/// This simulates what happens behind a reverse proxy like Fly.io:
+/// - Client signs with authority = "public-hostname.example.com"
+/// - Request arrives at server with:
+///   - Host header = "public-hostname.example.com" (preserved by proxy)
+///   - URI authority = "[internal-ip]:443" (set by proxy)
+/// - Server MUST use Host header for verification, not URI authority
+#[tokio::test]
+async fn test_host_header_preferred_over_uri_authority_for_signature_verification() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use http::uri::{Authority, Scheme};
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use tower::ServiceExt;
+
+    // Setup: use actual root key
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create bootstrap token with root's public key
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+
+    let app = create_test_app(root_key).await;
+
+    // The PUBLIC hostname that the client signs with (what SDK does)
+    let public_hostname = "public-hostname.example.com";
+    // The INTERNAL address that a reverse proxy would put in the URI
+    let internal_authority = "[2a09:8280:1::c8:df5b:0]:443";
+
+    let method = "GET";
+    let path = "/test";
+    let authorization = format!("Bearer {}", token_base64);
+
+    // Sign with the PUBLIC hostname (this is what the SDK does)
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => public_hostname.to_string(), // Sign with PUBLIC hostname
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    println!("Signed @authority: {}", public_hostname);
+    println!("URI authority: {}", internal_authority);
+    println!(
+        "Signature-Input: {}",
+        sig_headers.signature_input_header_value()
+    );
+
+    // Build request where:
+    // - URI has the INTERNAL authority (like a reverse proxy sets)
+    // - Host header has the PUBLIC hostname (what client originally sent)
+    let uri = http::Uri::builder()
+        .scheme(Scheme::HTTP)
+        .authority(Authority::try_from(internal_authority).unwrap())
+        .path_and_query(path)
+        .build()
+        .unwrap();
+
+    println!("Request URI: {}", uri);
+    println!("Request URI authority: {:?}", uri.authority());
+
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", public_hostname) // Host header = public hostname
+        .header("authorization", &authorization)
+        .header(
+            "signature-input",
+            sig_headers.signature_input_header_value(),
+        )
+        .header("signature", sig_headers.signature_header_value())
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    println!("Response status: {}", response.status());
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Server should use Host header (not URI authority) for signature verification. \
+         Signed authority='{}', URI authority='{}', Host header='{}'",
+        public_hostname,
+        internal_authority,
+        public_hostname
+    );
+}
