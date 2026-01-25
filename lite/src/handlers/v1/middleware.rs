@@ -66,7 +66,7 @@ pub async fn auth_middleware(
     let verified = auth::verify_token(&token_bytes, root_public_key)?;
 
     // Check revocation
-    if auth::is_revoked(&state.backend.db(), &verified.revocation_ids).await? {
+    if auth::is_revoked(state.backend.db(), &verified.revocation_ids).await? {
         return Err(ServiceError::TokenRevoked);
     }
 

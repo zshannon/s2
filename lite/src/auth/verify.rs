@@ -89,10 +89,8 @@ pub fn authorize(
     // The root key should only be usable for token management endpoints.
     if let Some(root_pk) = root_public_key {
         let root_as_client = ClientPublicKey::from_verifying_key(root_pk.verifying_key());
-        if signer_public_key == &root_as_client {
-            if !is_access_token_operation(operation) {
-                return Err(AuthorizeError::RootKeyNotAllowed);
-            }
+        if signer_public_key == &root_as_client && !is_access_token_operation(operation) {
+            return Err(AuthorizeError::RootKeyNotAllowed);
         }
     }
 
@@ -163,24 +161,24 @@ fn check_resource_scopes(
     }
 
     // Check basin scope
-    if let Some(basin_name) = basin {
-        if !is_resource_in_scope(basin_name, &basin_scopes) {
-            return Err(AuthorizeError::OutOfScope("basin".into()));
-        }
+    if let Some(basin_name) = basin
+        && !is_resource_in_scope(basin_name, &basin_scopes)
+    {
+        return Err(AuthorizeError::OutOfScope("basin".into()));
     }
 
     // Check stream scope
-    if let Some(stream_name) = stream {
-        if !is_resource_in_scope(stream_name, &stream_scopes) {
-            return Err(AuthorizeError::OutOfScope("stream".into()));
-        }
+    if let Some(stream_name) = stream
+        && !is_resource_in_scope(stream_name, &stream_scopes)
+    {
+        return Err(AuthorizeError::OutOfScope("stream".into()));
     }
 
     // Check access_token scope (for IssueAccessToken, RevokeAccessToken, etc.)
-    if let Some(token_id) = access_token_id {
-        if !is_resource_in_scope(token_id, &access_token_scopes) {
-            return Err(AuthorizeError::OutOfScope("access_token".into()));
-        }
+    if let Some(token_id) = access_token_id
+        && !is_resource_in_scope(token_id, &access_token_scopes)
+    {
+        return Err(AuthorizeError::OutOfScope("access_token".into()));
     }
 
     Ok(())
@@ -345,12 +343,11 @@ fn extract_public_keys_from_source(source: &str, public_keys: &mut Vec<ClientPub
                     false
                 };
 
-                if valid_termination {
-                    if let Ok(pk) = ClientPublicKey::from_base58(key_str) {
-                        if !public_keys.contains(&pk) {
-                            public_keys.push(pk);
-                        }
-                    }
+                if valid_termination
+                    && let Ok(pk) = ClientPublicKey::from_base58(key_str)
+                    && !public_keys.contains(&pk)
+                {
+                    public_keys.push(pk);
                 }
 
                 search_start = key_start + key_len;

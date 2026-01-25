@@ -111,15 +111,15 @@ mod tests {
         let id2 = vec![5, 6, 7, 8];
 
         // Initially not revoked
-        assert!(!is_revoked(&db, &[id1.clone()]).await.unwrap());
-        assert!(!is_revoked(&db, &[id2.clone()]).await.unwrap());
+        assert!(!is_revoked(&db, std::slice::from_ref(&id1)).await.unwrap());
+        assert!(!is_revoked(&db, std::slice::from_ref(&id2)).await.unwrap());
 
         // Revoke id1
         revoke(&db, &id1).await.unwrap();
 
         // Now id1 is revoked, id2 is not
-        assert!(is_revoked(&db, &[id1.clone()]).await.unwrap());
-        assert!(!is_revoked(&db, &[id2.clone()]).await.unwrap());
+        assert!(is_revoked(&db, std::slice::from_ref(&id1)).await.unwrap());
+        assert!(!is_revoked(&db, std::slice::from_ref(&id2)).await.unwrap());
 
         // Check with multiple IDs - should be true if any is revoked
         assert!(is_revoked(&db, &[id1.clone(), id2.clone()]).await.unwrap());
