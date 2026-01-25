@@ -15,7 +15,12 @@
       "Bash(cargo +nightly fmt:*)",
       "WebFetch(domain:s2.dev)",
       "Bash(cargo nextest run:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "WebFetch(domain:fly.io)",
+      "Bash(fly deploy --help:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run watch:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }
