@@ -1398,3 +1398,532 @@ async fn test_response_includes_git_sha_header() {
     );
     println!("X-Git-SHA: {}", sha_value);
 }
+
+/// Test that authority normalization strips default port :443
+/// Client signs with "localhost" but server sees Host: "localhost:443"
+#[tokio::test]
+async fn test_authority_normalization_strips_443() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use axum::{Router, middleware::from_fn_with_state, routing::get};
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use s2_lite::handlers::v1::middleware::{AppState, auth_middleware};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    // Setup keys
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create token
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+
+    // Create app
+    let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let db = slatedb::Db::builder("test", object_store)
+        .build()
+        .await
+        .unwrap();
+    let backend = s2_lite::backend::Backend::new(db, bytesize::ByteSize::b(1));
+    let auth_state = s2_lite::auth::AuthState::new(root_key, 300, None);
+
+    let app_state = AppState {
+        backend,
+        auth: auth_state,
+    };
+
+    let nested_routes = Router::new()
+        .route("/basins", get(|| async { "ok" }))
+        .route_layer(from_fn_with_state(app_state.clone(), auth_middleware));
+
+    let app = Router::new()
+        .nest("/v1", nested_routes)
+        .with_state(app_state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let authorization = format!("Bearer {}", token_base64);
+
+    // Sign with authority WITHOUT port (what RFC 9421 recommends for default ports)
+    let authority_for_signing = "localhost";
+    // But send Host header WITH :443 (what some proxies/load balancers add)
+    let host_header = "localhost:443";
+    let path = "/v1/basins";
+    let method = "GET";
+
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => authority_for_signing.to_string(),
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    println!("Authority signed: '{}'", authority_for_signing);
+    println!("Host header sent: '{}'", host_header);
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Authorization: {}\r\n\
+         Signature-Input: {}\r\n\
+         Signature: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        path,
+        host_header, // localhost:443
+        authorization,
+        sig_headers.signature_input_header_value(),
+        sig_headers.signature_header_value()
+    );
+
+    println!("=== Request ===\n{}", request);
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    println!("=== Response ===\n{}", response_str);
+
+    assert!(
+        response_str.contains("200 OK"),
+        "Server should normalize 'localhost:443' to 'localhost' to match signature. Got:\n{}",
+        response_str
+    );
+}
+
+/// Test that authority normalization strips default port :80
+#[tokio::test]
+async fn test_authority_normalization_strips_80() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use axum::{Router, middleware::from_fn_with_state, routing::get};
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use s2_lite::handlers::v1::middleware::{AppState, auth_middleware};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    // Setup keys
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create token
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+
+    // Create app
+    let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let db = slatedb::Db::builder("test", object_store)
+        .build()
+        .await
+        .unwrap();
+    let backend = s2_lite::backend::Backend::new(db, bytesize::ByteSize::b(1));
+    let auth_state = s2_lite::auth::AuthState::new(root_key, 300, None);
+
+    let app_state = AppState {
+        backend,
+        auth: auth_state,
+    };
+
+    let nested_routes = Router::new()
+        .route("/basins", get(|| async { "ok" }))
+        .route_layer(from_fn_with_state(app_state.clone(), auth_middleware));
+
+    let app = Router::new()
+        .nest("/v1", nested_routes)
+        .with_state(app_state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let authorization = format!("Bearer {}", token_base64);
+
+    // Sign with authority WITHOUT port
+    let authority_for_signing = "localhost";
+    // But send Host header WITH :80
+    let host_header = "localhost:80";
+    let path = "/v1/basins";
+    let method = "GET";
+
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => authority_for_signing.to_string(),
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    println!("Authority signed: '{}'", authority_for_signing);
+    println!("Host header sent: '{}'", host_header);
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Authorization: {}\r\n\
+         Signature-Input: {}\r\n\
+         Signature: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        path,
+        host_header, // localhost:80
+        authorization,
+        sig_headers.signature_input_header_value(),
+        sig_headers.signature_header_value()
+    );
+
+    println!("=== Request ===\n{}", request);
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    println!("=== Response ===\n{}", response_str);
+
+    assert!(
+        response_str.contains("200 OK"),
+        "Server should normalize 'localhost:80' to 'localhost' to match signature. Got:\n{}",
+        response_str
+    );
+}
+
+/// Test that non-default ports are NOT stripped (e.g., :8080)
+#[tokio::test]
+async fn test_authority_normalization_preserves_nondefault_port() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use axum::{Router, middleware::from_fn_with_state, routing::get};
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use s2_lite::handlers::v1::middleware::{AppState, auth_middleware};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    // Setup keys
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create token
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+
+    // Create app
+    let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let db = slatedb::Db::builder("test", object_store)
+        .build()
+        .await
+        .unwrap();
+    let backend = s2_lite::backend::Backend::new(db, bytesize::ByteSize::b(1));
+    let auth_state = s2_lite::auth::AuthState::new(root_key, 300, None);
+
+    let app_state = AppState {
+        backend,
+        auth: auth_state,
+    };
+
+    let nested_routes = Router::new()
+        .route("/basins", get(|| async { "ok" }))
+        .route_layer(from_fn_with_state(app_state.clone(), auth_middleware));
+
+    let app = Router::new()
+        .nest("/v1", nested_routes)
+        .with_state(app_state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let authorization = format!("Bearer {}", token_base64);
+
+    // Sign with authority INCLUDING non-default port
+    let authority_with_port = "localhost:8080";
+    let path = "/v1/basins";
+    let method = "GET";
+
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => authority_with_port.to_string(),
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    println!("Authority signed: '{}'", authority_with_port);
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Authorization: {}\r\n\
+         Signature-Input: {}\r\n\
+         Signature: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        path,
+        authority_with_port, // localhost:8080
+        authorization,
+        sig_headers.signature_input_header_value(),
+        sig_headers.signature_header_value()
+    );
+
+    println!("=== Request ===\n{}", request);
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    println!("=== Response ===\n{}", response_str);
+
+    assert!(
+        response_str.contains("200 OK"),
+        "Server should preserve non-default port :8080 in authority. Got:\n{}",
+        response_str
+    );
+}

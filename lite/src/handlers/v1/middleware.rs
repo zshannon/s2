@@ -91,6 +91,13 @@ pub async fn auth_middleware(
                 .map(String::from)
         })
         .unwrap_or_default();
+    // Normalize authority: remove default port (:443 for HTTPS, :80 for HTTP)
+    // This matches how clients compute @authority per RFC 9421
+    let authority = authority
+        .strip_suffix(":443")
+        .or_else(|| authority.strip_suffix(":80"))
+        .unwrap_or(&authority)
+        .to_string();
 
     // Check if request has a body that needs Content-Digest verification
     let has_body = matches!(method, Method::POST | Method::PUT | Method::PATCH)
