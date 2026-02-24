@@ -1370,8 +1370,13 @@ async fn test_response_includes_git_sha_header() {
     let backend = s2_lite::backend::Backend::new(db, bytesize::ByteSize::b(1));
     let auth_state = s2_lite::auth::AuthState::disabled();
 
+    let app_state = s2_lite::handlers::v1::AppState {
+        backend,
+        auth: auth_state,
+    };
+
     // Use the full router (which should include the git SHA layer)
-    let app = s2_lite::handlers::router(backend, auth_state);
+    let app = s2_lite::handlers::router(&app_state).with_state(app_state);
 
     // Make a simple request to /ping
     let request = Request::builder()
