@@ -28,4 +28,4 @@ COPY --from=builder /build/target/release/server /app/s2-lite
 
 EXPOSE 80
 
-ENTRYPOINT ["/app/s2-lite", "--port", "80", "--local-path", "/data"]
+ENTRYPOINT ["/app/s2-lite", "--port", "80", "--local-root", "/data"]
