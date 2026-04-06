@@ -66,7 +66,11 @@ pub async fn auth_middleware(
     let verified = auth::verify_token(&token_bytes, root_public_key)?;
 
     // Check revocation
-    if auth::is_revoked(state.backend.db(), &verified.revocation_ids).await? {
+    if state
+        .backend
+        .is_token_revoked(&verified.revocation_ids)
+        .await?
+    {
         return Err(ServiceError::TokenRevoked);
     }
 
@@ -87,12 +91,7 @@ pub async fn auth_middleware(
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(String::from)
-        .or_else(|| {
-            request
-                .uri()
-                .authority()
-                .map(|a| a.to_string())
-        })
+        .or_else(|| request.uri().authority().map(|a| a.to_string()))
         .unwrap_or_default();
     // Normalize authority: remove default port (:443 for HTTPS, :80 for HTTP)
     // This matches how clients compute @authority per RFC 9421

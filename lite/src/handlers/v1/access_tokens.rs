@@ -220,7 +220,7 @@ pub async fn revoke_access_token(
         .map_err(|_| ServiceError::Validation("invalid revocation_id hex".into()))?;
 
     // Add to revocation storage
-    auth::revoke(backend.db(), &revocation_id).await?;
+    backend.revoke_token(&revocation_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1,5 +1,6 @@
 pub mod error;
 
+mod auth;
 mod basins;
 pub mod bgtasks;
 mod core;

@@ -178,8 +178,11 @@ impl TryFrom<AccessTokenInfo> for types::access::IssueAccessTokenRequest {
     type Error = types::ValidationError;
 
     fn try_from(value: AccessTokenInfo) -> Result<Self, Self::Error> {
+        let id = value.id.ok_or_else(|| {
+            types::ValidationError::from("access token id is required".to_string())
+        })?;
         Ok(Self {
-            id: value.id,
+            id,
             public_key: value.public_key,
             expires_at: value.expires_at,
             auto_prefix_streams: value.auto_prefix_streams.unwrap_or_default(),
@@ -203,7 +206,7 @@ impl From<types::access::AccessTokenInfo> for AccessTokenInfo {
 impl From<types::access::IssueAccessTokenRequest> for AccessTokenInfo {
     fn from(value: types::access::IssueAccessTokenRequest) -> Self {
         Self {
-            id: value.id,
+            id: Some(value.id),
             public_key: value.public_key,
             expires_at: value.expires_at,
             auto_prefix_streams: Some(value.auto_prefix_streams),
