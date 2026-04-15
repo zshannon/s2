@@ -172,7 +172,7 @@ fn parse_bearer_token(header: &str) -> Result<Vec<u8>, ServiceError> {
         return Err(ServiceError::AuthRequired);
     }
 
-    base64ct::Base64::decode_vec(parts[1]).map_err(|_| ServiceError::AuthRequired)
+    base64ct::Base64Url::decode_vec(parts[1]).map_err(|_| ServiceError::AuthRequired)
 }
 
 impl axum::extract::FromRef<AppState> for Backend {

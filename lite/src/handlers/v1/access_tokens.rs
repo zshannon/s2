@@ -161,7 +161,7 @@ pub async fn issue_access_token(
     let token_bytes = biscuit
         .to_vec()
         .map_err(|e| ServiceError::Validation(format!("failed to serialize token: {e}").into()))?;
-    let access_token = base64ct::Base64::encode_string(&token_bytes);
+    let access_token = base64ct::Base64Url::encode_string(&token_bytes);
 
     Ok((
         StatusCode::CREATED,

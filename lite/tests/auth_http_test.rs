@@ -59,7 +59,7 @@ fn build_test_token(root_key: &RootKey, client_pubkey: &ClientPublicKey) -> Stri
 
     let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
     let biscuit = build_token(root_key, client_pubkey, expires, &scope).unwrap();
-    base64ct::Base64::encode_string(&biscuit.to_vec().unwrap())
+    base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap())
 }
 
 /// Create a test app with auth middleware.
@@ -293,7 +293,7 @@ async fn test_real_http_request_bootstrap_mode() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Start actual HTTP server
     let app = create_test_app(root_key).await;
@@ -505,7 +505,7 @@ async fn test_bootstrap_mode_root_key_signs_request() {
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
     let token_bytes = biscuit.to_vec().unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&token_bytes);
+    let token_base64 = base64ct::Base64Url::encode_string(&token_bytes);
 
     println!(
         "Biscuit block source:\n{}",
@@ -753,7 +753,7 @@ async fn test_localhost_authority_without_port() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Start server on random port
     let app = create_test_app(root_key).await;
@@ -911,7 +911,7 @@ async fn test_with_axum_server_localhost_authority() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Start server using axum_server (like the live server does!)
     let app = create_test_app(root_key).await;
@@ -1077,7 +1077,7 @@ async fn test_nested_router_path_stripping() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Create app with NESTED router structure like the live server
     let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -1260,7 +1260,7 @@ async fn test_live_server_localhost() {
     println!("=== Biscuit block source ===");
     println!("{}", biscuit.print_block_source(0).unwrap());
 
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
     let authorization = format!("Bearer {}", token_base64);
 
     // Sign for localhost (no port - default 80)
@@ -1460,7 +1460,7 @@ async fn test_authority_normalization_strips_443() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Create app
     let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -1637,7 +1637,7 @@ async fn test_authority_normalization_strips_80() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Create app
     let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -1814,7 +1814,7 @@ async fn test_authority_normalization_preserves_nondefault_port() {
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     // Create app
     let object_store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -1991,7 +1991,7 @@ async fn test_host_header_preferred_over_uri_authority_for_signature_verificatio
     builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
 
     let biscuit = builder.build(&biscuit_keypair).unwrap();
-    let token_base64 = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    let token_base64 = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
 
     let app = create_test_app(root_key).await;
 
@@ -2092,5 +2092,311 @@ async fn test_host_header_preferred_over_uri_authority_for_signature_verificatio
         public_hostname,
         internal_authority,
         public_hostname
+    );
+}
+
+/// The biscuit spec (biscuitsec.org) mandates base64url WITH padding (RFC 4648 §5)
+/// for token serialization. The Rust biscuit-auth crate uses `base64::URL_SAFE` throughout.
+/// This test encodes a valid token with `Base64Url` (the spec-correct encoding) and verifies
+/// the server accepts it. This MUST pass — it's the canonical format.
+#[tokio::test]
+async fn test_base64url_padded_token_accepted() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use tokio::net::TcpListener;
+
+    // Setup keys (same as test_real_http_request_bootstrap_mode)
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create token
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+
+    // KEY DIFFERENCE: encode with Base64Url (spec-correct) instead of Base64 (wrong)
+    let token_base64url = base64ct::Base64Url::encode_string(&biscuit.to_vec().unwrap());
+
+    // Sanity check: the encodings actually differ
+    let token_base64_std = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+    assert_ne!(
+        token_base64url, token_base64_std,
+        "base64url and standard base64 must differ for this test to be meaningful"
+    );
+
+    // Start actual HTTP server
+    let app = create_test_app(root_key).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Build request with base64url token
+    let authorization = format!("Bearer {}", token_base64url);
+
+    // Sign request (identical to bootstrap test)
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let authority = format!("127.0.0.1:{}", addr.port());
+    let path = "/test";
+    let method = "GET";
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => authority.clone(),
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    // Make actual HTTP request
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let request = format!(
+        "GET /test HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Authorization: {}\r\n\
+         Signature-Input: {}\r\n\
+         Signature: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        authority,
+        authorization,
+        sig_headers.signature_input_header_value(),
+        sig_headers.signature_header_value()
+    );
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("200 OK"),
+        "Server must accept base64url-padded tokens (biscuit spec canonical encoding), got:\n{}",
+        response_str
+    );
+}
+
+/// Standard base64 is NOT the biscuit spec encoding. The server should reject it.
+#[tokio::test]
+async fn test_standard_base64_token_rejected() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use biscuit_auth::{
+        KeyPair, PrivateKey,
+        builder::{Algorithm, BiscuitBuilder},
+    };
+    use httpsig::prelude::{
+        AlgorithmName, HttpSignatureBase, HttpSignatureParams, SecretKey,
+        message_component::{
+            HttpMessageComponent, HttpMessageComponentId, HttpMessageComponentName,
+        },
+    };
+    use p256::ecdsa::SigningKey;
+    use tokio::net::TcpListener;
+
+    // Setup keys
+    let root_key_base58 = "ByDGSRM82bqEVQoGYpZzvmmHujrB32UN1sr7WbKN6TPQ";
+    let root_key = RootKey::from_base58(root_key_base58).unwrap();
+    let key_bytes = bs58::decode(root_key_base58).into_vec().unwrap();
+    let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
+    let public_key = signing_key.verifying_key();
+    let public_key_base58 =
+        bs58::encode(public_key.to_encoded_point(true).as_bytes()).into_string();
+
+    // Create token
+    let biscuit_private = PrivateKey::from_bytes(&key_bytes, Algorithm::Secp256r1).unwrap();
+    let biscuit_keypair = KeyPair::from(&biscuit_private);
+    let expires_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut builder = BiscuitBuilder::new();
+    builder = builder
+        .fact(format!("public_key(\"{}\")", public_key_base58).as_str())
+        .unwrap();
+    builder = builder
+        .fact(format!("expires({})", expires_ts).as_str())
+        .unwrap();
+    builder = builder
+        .check(format!("check if time($t), $t < {}", expires_ts).as_str())
+        .unwrap();
+    builder = builder.fact("op_group(\"account\", \"read\")").unwrap();
+    builder = builder.fact("basin_scope(\"prefix\", \"\")").unwrap();
+
+    let biscuit = builder.build(&biscuit_keypair).unwrap();
+
+    // Encode with standard base64 (WRONG per biscuit spec)
+    let token_base64_std = base64ct::Base64::encode_string(&biscuit.to_vec().unwrap());
+
+    // Start actual HTTP server
+    let app = create_test_app(root_key).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Build request with standard base64 token
+    let authorization = format!("Bearer {}", token_base64_std);
+
+    // Sign request
+    let component_ids: Vec<HttpMessageComponentId> =
+        ["@method", "@path", "@authority", "authorization"]
+            .iter()
+            .map(|c| HttpMessageComponentId::try_from(*c).unwrap())
+            .collect();
+
+    let authority = format!("127.0.0.1:{}", addr.port());
+    let path = "/test";
+    let method = "GET";
+
+    let mut component_lines = Vec::new();
+    for id in &component_ids {
+        let line = match &id.name {
+            HttpMessageComponentName::Derived(derived) => {
+                let derived_str: &str = derived.as_ref();
+                let value = match derived_str {
+                    "@method" => method.to_uppercase(),
+                    "@path" => path.to_string(),
+                    "@authority" => authority.clone(),
+                    other => panic!("unexpected: {}", other),
+                };
+                format!("\"{}\": {}", derived_str, value)
+            }
+            HttpMessageComponentName::HttpField(name) => {
+                format!("\"{}\": {}", name, authorization)
+            }
+        };
+        let component = HttpMessageComponent::try_from(line.as_str()).unwrap();
+        component_lines.push(component);
+    }
+
+    let mut sig_params = HttpSignatureParams::try_new(&component_ids).unwrap();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sig_params.set_created(created);
+
+    let httpsig_secret = SecretKey::from_bytes(AlgorithmName::EcdsaP256Sha256, &key_bytes).unwrap();
+    sig_params.set_key_info(&httpsig_secret);
+    sig_params.set_keyid(&public_key_base58);
+
+    let signature_base = HttpSignatureBase::try_new(&component_lines, &sig_params).unwrap();
+    let sig_headers = signature_base
+        .build_signature_headers(&httpsig_secret, Some("sig1"))
+        .unwrap();
+
+    // Make actual HTTP request
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let request = format!(
+        "GET /test HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Authorization: {}\r\n\
+         Signature-Input: {}\r\n\
+         Signature: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        authority,
+        authorization,
+        sig_headers.signature_input_header_value(),
+        sig_headers.signature_header_value()
+    );
+
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("403"),
+        "Server must reject standard base64 tokens (not biscuit spec encoding), got:\n{}",
+        response_str
     );
 }
