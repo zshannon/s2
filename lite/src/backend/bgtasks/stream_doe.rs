@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use enum_ordinalize::Ordinalize;
 use futures::{StreamExt, stream};
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -9,17 +8,19 @@ use s2_common::{
     types::resources::Page,
 };
 use slatedb::{
-    WriteBatch,
+    IterationOrder, WriteBatch,
     config::{DurabilityLevel, PutOptions, ScanOptions, WriteOptions},
 };
 use tracing::instrument;
 
-use crate::backend::{
-    Backend,
-    error::{DeleteStreamError, StorageError, StreamDeleteOnEmptyError},
-    kv::{self, timestamp::TimestampSecs},
+use crate::{
+    backend::{
+        Backend,
+        error::{DeleteStreamError, StorageError, StreamDeleteOnEmptyError},
+        kv::{self, timestamp::TimestampSecs},
+        streamer::{doe_arm_delay, retention_age_or_zero},
+    },
     stream_id::StreamId,
-    streamer::{doe_arm_delay, retention_age_or_zero},
 };
 
 const PENDING_LIST_LIMIT: usize = 10_000;
@@ -60,6 +61,7 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self
             .db
@@ -161,12 +163,13 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self.db.scan_with_options(start_key.., &SCAN_OPTS).await?;
         let Some(kv) = it.next().await? else {
             return Ok(false);
         };
-        if kv.key.first().copied() != Some(kv::KeyType::StreamRecordTimestamp.ordinal()) {
+        if kv.key.first().copied() != Some(kv::KeyType::StreamRecordTimestamp as u8) {
             return Ok(false);
         }
         let (candidate_stream_id, _pos) = kv::stream_record_timestamp::deser_key(kv.key)?;
@@ -225,11 +228,17 @@ mod tests {
             stream::StreamName,
         },
     };
-    use slatedb::config::{DurabilityLevel, ScanOptions};
+    use slatedb::{
+        IterationOrder,
+        config::{DurabilityLevel, ScanOptions},
+    };
     use time::OffsetDateTime;
 
     use super::{super::tests::test_backend, TimestampSecs};
-    use crate::backend::{Backend, kv, stream_id::StreamId};
+    use crate::{
+        backend::{Backend, kv},
+        stream_id::StreamId,
+    };
 
     const MIN_AGE: Duration = Duration::from_secs(60);
 
@@ -243,6 +252,7 @@ mod tests {
     ) -> kv::stream_meta::StreamMeta {
         kv::stream_meta::StreamMeta {
             config,
+            cipher: None,
             created_at,
             deleted_at: None,
             creation_idempotency_key: None,
@@ -286,6 +296,7 @@ mod tests {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = backend
             .db

@@ -3,7 +3,10 @@
 //! Revocation IDs are stored with a dedicated prefix to avoid conflicts
 //! with the main KV store (which uses numeric ordinals 1-8).
 
-use slatedb::config::{ReadOptions, ScanOptions};
+use slatedb::{
+    IterationOrder,
+    config::{ReadOptions, ScanOptions},
+};
 
 /// Prefix for revocation keys.
 /// Starts with 'r' (114) which won't conflict with main KV ordinals (1-8).
@@ -47,6 +50,7 @@ pub async fn list_revocations(db: &slatedb::Db) -> Result<Vec<String>, Revocatio
         read_ahead_bytes: 4096,
         cache_blocks: true,
         max_fetch_tasks: 1,
+        order: IterationOrder::Ascending,
     };
 
     let mut ids = Vec::new();

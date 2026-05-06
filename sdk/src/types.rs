@@ -19,6 +19,10 @@ use http::{
 use rand::RngExt;
 use s2_api::{v1 as api, v1::stream::s2s::CompressionAlgorithm};
 pub use s2_common::caps::RECORD_BATCH_MAX;
+/// Encryption algorithm.
+pub use s2_common::encryption::EncryptionAlgorithm;
+/// Encryption key for stream operations.
+pub use s2_common::encryption::EncryptionKey;
 /// Validation error.
 pub use s2_common::types::ValidationError;
 /// Access token ID.
@@ -776,6 +780,8 @@ pub struct BasinConfig {
     ///
     /// See [`StreamConfig`] for defaults.
     pub default_stream_config: Option<StreamConfig>,
+    /// Encryption algorithm to apply to newly created streams in the basin.
+    pub stream_cipher: Option<EncryptionAlgorithm>,
     /// Whether to create stream on append if it doesn't exist using default stream configuration.
     ///
     /// Defaults to `false`.
@@ -796,6 +802,14 @@ impl BasinConfig {
     pub fn with_default_stream_config(self, config: StreamConfig) -> Self {
         Self {
             default_stream_config: Some(config),
+            ..self
+        }
+    }
+
+    /// Set the encryption algorithm to apply to newly created streams in the basin.
+    pub fn with_stream_cipher(self, stream_cipher: EncryptionAlgorithm) -> Self {
+        Self {
+            stream_cipher: Some(stream_cipher),
             ..self
         }
     }
@@ -822,6 +836,7 @@ impl From<api::config::BasinConfig> for BasinConfig {
     fn from(value: api::config::BasinConfig) -> Self {
         Self {
             default_stream_config: value.default_stream_config.map(Into::into),
+            stream_cipher: value.stream_cipher.map(Into::into),
             create_stream_on_append: value.create_stream_on_append,
             create_stream_on_read: value.create_stream_on_read,
         }
@@ -832,6 +847,7 @@ impl From<BasinConfig> for api::config::BasinConfig {
     fn from(value: BasinConfig) -> Self {
         Self {
             default_stream_config: value.default_stream_config.map(Into::into),
+            stream_cipher: value.stream_cipher.map(Into::into),
             create_stream_on_append: value.create_stream_on_append,
             create_stream_on_read: value.create_stream_on_read,
         }
@@ -843,12 +859,18 @@ impl From<BasinConfig> for api::config::BasinConfig {
 pub enum BasinScope {
     /// AWS `us-east-1` region.
     AwsUsEast1,
+    /// AWS `us-west-2` region.
+    AwsUsWest2,
+    /// AWS `eu-north-1` region.
+    AwsEuNorth1,
 }
 
 impl From<api::basin::BasinScope> for BasinScope {
     fn from(value: api::basin::BasinScope) -> Self {
         match value {
             api::basin::BasinScope::AwsUsEast1 => BasinScope::AwsUsEast1,
+            api::basin::BasinScope::AwsUsWest2 => BasinScope::AwsUsWest2,
+            api::basin::BasinScope::AwsEuNorth1 => BasinScope::AwsEuNorth1,
         }
     }
 }
@@ -857,6 +879,8 @@ impl From<BasinScope> for api::basin::BasinScope {
     fn from(value: BasinScope) -> Self {
         match value {
             BasinScope::AwsUsEast1 => api::basin::BasinScope::AwsUsEast1,
+            BasinScope::AwsUsWest2 => api::basin::BasinScope::AwsUsWest2,
+            BasinScope::AwsEuNorth1 => api::basin::BasinScope::AwsEuNorth1,
         }
     }
 }
@@ -1318,6 +1342,8 @@ impl From<StreamReconfiguration> for api::config::StreamReconfiguration {
 pub struct BasinReconfiguration {
     /// Override for the existing [`default_stream_config`](BasinConfig::default_stream_config).
     pub default_stream_config: Maybe<Option<StreamReconfiguration>>,
+    /// Override for the existing [`stream_cipher`](BasinConfig::stream_cipher).
+    pub stream_cipher: Maybe<Option<EncryptionAlgorithm>>,
     /// Override for the existing
     /// [`create_stream_on_append`](BasinConfig::create_stream_on_append).
     pub create_stream_on_append: Maybe<bool>,
@@ -1336,6 +1362,14 @@ impl BasinReconfiguration {
     pub fn with_default_stream_config(self, config: StreamReconfiguration) -> Self {
         Self {
             default_stream_config: Maybe::Specified(Some(config)),
+            ..self
+        }
+    }
+
+    /// Set the override for the existing [`stream_cipher`](BasinConfig::stream_cipher).
+    pub fn with_stream_cipher(self, stream_cipher: EncryptionAlgorithm) -> Self {
+        Self {
+            stream_cipher: Maybe::Specified(Some(stream_cipher)),
             ..self
         }
     }
@@ -1363,6 +1397,7 @@ impl From<BasinReconfiguration> for api::config::BasinReconfiguration {
     fn from(value: BasinReconfiguration) -> Self {
         Self {
             default_stream_config: value.default_stream_config.map(|m| m.map(Into::into)),
+            stream_cipher: value.stream_cipher.map(|m| m.map(Into::into)),
             create_stream_on_append: value.create_stream_on_append,
             create_stream_on_read: value.create_stream_on_read,
         }
@@ -2601,6 +2636,8 @@ pub struct StreamInfo {
     pub created_at: S2DateTime,
     /// Deletion time if the stream is being deleted.
     pub deleted_at: Option<S2DateTime>,
+    /// Encryption algorithm for this stream, if encryption is enabled.
+    pub cipher: Option<EncryptionAlgorithm>,
 }
 
 impl TryFrom<api::stream::StreamInfo> for StreamInfo {
@@ -2611,6 +2648,7 @@ impl TryFrom<api::stream::StreamInfo> for StreamInfo {
             name: value.name,
             created_at: value.created_at.try_into()?,
             deleted_at: value.deleted_at.map(S2DateTime::try_from).transpose()?,
+            cipher: value.cipher.map(Into::into),
         })
     }
 }
@@ -3488,17 +3526,9 @@ pub struct ReadBatch {
 }
 
 impl ReadBatch {
-    pub(crate) fn from_api(
-        batch: api::stream::proto::ReadBatch,
-        ignore_command_records: bool,
-    ) -> Self {
+    pub(crate) fn from_api(batch: api::stream::proto::ReadBatch) -> Self {
         Self {
-            records: batch
-                .records
-                .into_iter()
-                .map(Into::into)
-                .filter(|sr: &SequencedRecord| !ignore_command_records || !sr.is_command_record())
-                .collect(),
+            records: batch.records.into_iter().map(Into::into).collect(),
             tail: batch.tail.map(Into::into),
         }
     }

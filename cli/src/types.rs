@@ -4,8 +4,8 @@ use clap::{Args, Parser, ValueEnum};
 use s2_sdk::{
     self as sdk,
     types::{
-        AccessTokenId, AccessTokenIdPrefix, BasinName, BasinNamePrefix, StreamName,
-        StreamNamePrefix, TimeseriesInterval,
+        AccessTokenId, AccessTokenIdPrefix, BasinName, BasinNamePrefix, EncryptionAlgorithm,
+        StreamName, StreamNamePrefix, TimeseriesInterval,
     },
 };
 use serde::Serialize;
@@ -130,6 +130,9 @@ impl FromStr for S2BasinAndStreamUri {
 pub struct BasinConfig {
     #[clap(flatten)]
     pub default_stream_config: StreamConfig,
+    /// Encryption algorithm to apply to newly created streams in this basin.
+    #[arg(long)]
+    pub stream_cipher: Option<EncryptionAlgorithm>,
     /// Create stream on append with basin defaults if it doesn't exist.
     #[arg(long, default_value_t = false)]
     pub create_stream_on_append: bool,
@@ -170,6 +173,19 @@ impl StreamConfig {
 }
 
 #[derive(ValueEnum, Debug, Clone, Serialize)]
+pub enum BasinScope {
+    #[value(name = "aws:us-east-1")]
+    #[serde(rename = "aws:us-east-1")]
+    AwsUsEast1,
+    #[value(name = "aws:us-west-2")]
+    #[serde(rename = "aws:us-west-2")]
+    AwsUsWest2,
+    #[value(name = "aws:eu-north-1")]
+    #[serde(rename = "aws:eu-north-1")]
+    AwsEuNorth1,
+}
+
+#[derive(ValueEnum, Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageClass {
     Standard,
@@ -198,7 +214,7 @@ pub struct TimestampingConfig {
 #[derive(Clone, Debug, Serialize)]
 pub enum RetentionPolicy {
     #[allow(dead_code)]
-    Age(Duration),
+    Age(#[serde(serialize_with = "serialize_duration_humantime")] Duration),
     Infinite,
 }
 
@@ -226,6 +242,7 @@ impl FromStr for RetentionPolicy {
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct DeleteOnEmptyConfig {
     #[arg(long, value_parser = humantime::parse_duration, required = false)]
+    #[serde(serialize_with = "serialize_duration_humantime")]
     /// Minimum age before an empty stream can be deleted.
     /// Example: 1d, 1w, 1y
     pub delete_on_empty_min_age: Duration,
@@ -253,8 +270,12 @@ impl From<sdk::types::DeleteOnEmptyConfig> for DeleteOnEmptyConfig {
 
 impl From<BasinConfig> for sdk::types::BasinConfig {
     fn from(config: BasinConfig) -> Self {
-        sdk::types::BasinConfig::new()
-            .with_default_stream_config(config.default_stream_config.into())
+        let mut basin_config = sdk::types::BasinConfig::new()
+            .with_default_stream_config(config.default_stream_config.into());
+        if let Some(algorithm) = config.stream_cipher {
+            basin_config = basin_config.with_stream_cipher(algorithm);
+        }
+        basin_config
             .with_create_stream_on_append(config.create_stream_on_append)
             .with_create_stream_on_read(config.create_stream_on_read)
     }
@@ -276,6 +297,26 @@ impl From<StreamConfig> for sdk::types::StreamConfig {
             stream_config = stream_config.with_delete_on_empty(delete_on_empty.into());
         }
         stream_config
+    }
+}
+
+impl From<BasinScope> for sdk::types::BasinScope {
+    fn from(scope: BasinScope) -> Self {
+        match scope {
+            BasinScope::AwsUsEast1 => sdk::types::BasinScope::AwsUsEast1,
+            BasinScope::AwsUsWest2 => sdk::types::BasinScope::AwsUsWest2,
+            BasinScope::AwsEuNorth1 => sdk::types::BasinScope::AwsEuNorth1,
+        }
+    }
+}
+
+impl From<sdk::types::BasinScope> for BasinScope {
+    fn from(scope: sdk::types::BasinScope) -> Self {
+        match scope {
+            sdk::types::BasinScope::AwsUsEast1 => BasinScope::AwsUsEast1,
+            sdk::types::BasinScope::AwsUsWest2 => BasinScope::AwsUsWest2,
+            sdk::types::BasinScope::AwsEuNorth1 => BasinScope::AwsEuNorth1,
+        }
     }
 }
 
@@ -366,6 +407,7 @@ impl From<sdk::types::BasinConfig> for BasinConfig {
                 .default_stream_config
                 .map(Into::into)
                 .unwrap_or_default(),
+            stream_cipher: config.stream_cipher,
             create_stream_on_append: config.create_stream_on_append,
             create_stream_on_read: config.create_stream_on_read,
         }
@@ -449,6 +491,13 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(&value.to_string())
+}
+
+fn serialize_duration_humantime<S>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&humantime::format_duration(*value).to_string())
 }
 
 impl FromStr for BasinMatcher {

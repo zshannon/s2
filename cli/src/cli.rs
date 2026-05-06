@@ -3,7 +3,8 @@ use std::{num::NonZeroU64, path::PathBuf};
 use clap::{Args, Parser, Subcommand, builder::styling};
 use s2_sdk::types::{
     AccessTokenId, AccessTokenIdPrefix, AccessTokenIdStartAfter, BasinNamePrefix,
-    BasinNameStartAfter, FencingToken, StreamNamePrefix, StreamNameStartAfter,
+    BasinNameStartAfter, EncryptionAlgorithm, EncryptionKey, FencingToken, StreamNamePrefix,
+    StreamNameStartAfter,
 };
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
         parse_records_output_source,
     },
     types::{
-        AccessTokenMatcher, BasinConfig, BasinMatcher, Interval, Operation,
+        AccessTokenMatcher, BasinConfig, BasinMatcher, BasinScope, Interval, Operation,
         PermittedOperationGroups, S2BasinAndMaybeStreamUri, S2BasinAndStreamUri, S2BasinUri,
         StorageClass, StreamConfig, StreamMatcher,
     },
@@ -264,6 +265,10 @@ pub struct CreateBasinArgs {
     /// Name of the basin to create.
     pub basin: S2BasinUri,
 
+    /// Cloud provider and region for the basin.
+    #[arg(long)]
+    pub scope: Option<BasinScope>,
+
     #[command(flatten)]
     pub config: BasinConfig,
 }
@@ -272,6 +277,10 @@ pub struct CreateBasinArgs {
 pub struct ReconfigureBasinArgs {
     /// Name of the basin to reconfigure.
     pub basin: S2BasinUri,
+
+    /// Encryption algorithm to apply to newly created streams in this basin.
+    #[arg(long)]
+    pub stream_cipher: Option<EncryptionAlgorithm>,
 
     /// Create stream on append with basin defaults if it doesn't exist.
     #[arg(long)]
@@ -464,6 +473,33 @@ pub struct AppendArgs {
     /// How long to wait for more records before flushing a batch.
     #[arg(long, default_value = "5ms")]
     pub linger: humantime::Duration,
+
+    #[command(flatten)]
+    pub encryption_key: EncryptionKeyArgs,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct EncryptionKeyArgs {
+    /// Base64-encoded encryption key material.
+    /// Alternatively, set `S2_ENCRYPTION_KEY`.
+    #[arg(
+        short = 'k',
+        long = "encryption-key",
+        env = "S2_ENCRYPTION_KEY",
+        hide_env_values = true,
+        value_name = "KEY",
+        group = "encryption_key_source"
+    )]
+    pub key: Option<EncryptionKey>,
+
+    /// Read base64-encoded encryption key material from file.
+    #[arg(
+        long = "encryption-key-file",
+        conflicts_with = "key",
+        value_name = "FILE",
+        group = "encryption_key_source"
+    )]
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -515,6 +551,9 @@ pub struct ReadArgs {
     /// Use "-" to write to stdout.
     #[arg(short = 'o', long, value_parser = parse_records_output_source, default_value = "-")]
     pub output: RecordsOut,
+
+    #[command(flatten)]
+    pub encryption_key: EncryptionKeyArgs,
 }
 
 #[derive(Args, Debug)]
@@ -539,6 +578,9 @@ pub struct TailArgs {
     /// Use "-" to write to stdout.
     #[arg(short = 'o', long, value_parser = parse_records_output_source, default_value = "-")]
     pub output: RecordsOut,
+
+    #[command(flatten)]
+    pub encryption_key: EncryptionKeyArgs,
 }
 
 #[derive(Args, Debug)]

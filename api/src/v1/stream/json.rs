@@ -74,9 +74,10 @@ impl Serialize for RecordJson<'_> {
         // Some records omit `headers` and/or `body`, but `serde_json` does not rely on an exact
         // field count here, so keep the fixed upper bound and avoid extra bookkeeping.
         let mut state = serializer.serialize_struct("SequencedRecord", 4)?;
-        state.serialize_field("seq_num", &self.record.position.seq_num)?;
-        state.serialize_field("timestamp", &self.record.position.timestamp)?;
-        match &self.record.record {
+        let position = self.record.position();
+        state.serialize_field("seq_num", &position.seq_num)?;
+        state.serialize_field("timestamp", &position.timestamp)?;
+        match self.record.inner() {
             record::Record::Command(command) => {
                 state.serialize_field(
                     "headers",
@@ -296,6 +297,7 @@ impl std::fmt::Display for Base64Display<'_> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use s2_common::record::MeteredExt;
 
     use super::*;
     use crate::v1::stream::ReadBatch;
@@ -322,19 +324,19 @@ mod tests {
 
         types::stream::ReadBatch {
             records: vec![
-                record::Metered::from(envelope).sequenced(record::StreamPosition {
+                envelope.metered().sequenced(record::StreamPosition {
                     seq_num: 7,
                     timestamp: 11,
                 }),
-                record::Metered::from(empty_fence).sequenced(record::StreamPosition {
+                empty_fence.metered().sequenced(record::StreamPosition {
                     seq_num: 8,
                     timestamp: 12,
                 }),
-                record::Metered::from(non_empty_fence).sequenced(record::StreamPosition {
+                non_empty_fence.metered().sequenced(record::StreamPosition {
                     seq_num: 9,
                     timestamp: 13,
                 }),
-                record::Metered::from(trim).sequenced(record::StreamPosition {
+                trim.metered().sequenced(record::StreamPosition {
                     seq_num: 10,
                     timestamp: 14,
                 }),

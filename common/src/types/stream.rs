@@ -9,10 +9,11 @@ use super::{
 };
 use crate::{
     caps,
+    encryption::{EncryptionAlgorithm, EncryptionSpec},
     read_extent::{ReadLimit, ReadUntil},
     record::{
-        FencingToken, Metered, MeteredSize, Record, SeqNum, SequencedRecord, StreamPosition,
-        Timestamp,
+        FencingToken, Metered, MeteredExt, MeteredSize, Record, RecordDecryptionError, SeqNum,
+        Sequenced, StoredRecord, StreamPosition, Timestamp, decrypt_stored_record, encrypt_record,
     },
     types::resources::ListItemsRequest,
 };
@@ -168,48 +169,52 @@ pub struct StreamInfo {
     pub name: StreamName,
     pub created_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,
+    pub cipher: Option<EncryptionAlgorithm>,
 }
 
 #[derive(Debug, Clone)]
-pub struct AppendRecord(AppendRecordParts);
+pub struct AppendRecord<T = Record>(AppendRecordParts<T>);
 
-impl Deref for AppendRecord {
-    type Target = AppendRecordParts;
+impl<T> AppendRecord<T> {
+    pub fn parts(&self) -> &AppendRecordParts<T> {
+        let Self(parts) = self;
+        parts
+    }
 
-    fn deref(&self) -> &Self::Target {
+    pub fn into_parts(self) -> AppendRecordParts<T> {
         let Self(parts) = self;
         parts
     }
 }
 
-impl MeteredSize for AppendRecord {
+impl<T> MeteredSize for AppendRecord<T> {
     fn metered_size(&self) -> usize {
         self.0.record.metered_size()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct AppendRecordParts {
+pub struct AppendRecordParts<T = Record> {
     pub timestamp: Option<Timestamp>,
-    pub record: Metered<Record>,
+    pub record: Metered<T>,
 }
 
-impl MeteredSize for AppendRecordParts {
+impl<T> MeteredSize for AppendRecordParts<T> {
     fn metered_size(&self) -> usize {
         self.record.metered_size()
     }
 }
 
-impl From<AppendRecord> for AppendRecordParts {
-    fn from(AppendRecord(parts): AppendRecord) -> Self {
-        parts
+impl<T> From<AppendRecord<T>> for AppendRecordParts<T> {
+    fn from(record: AppendRecord<T>) -> Self {
+        record.into_parts()
     }
 }
 
-impl TryFrom<AppendRecordParts> for AppendRecord {
+impl<T> TryFrom<AppendRecordParts<T>> for AppendRecord<T> {
     type Error = &'static str;
 
-    fn try_from(parts: AppendRecordParts) -> Result<Self, Self::Error> {
+    fn try_from(parts: AppendRecordParts<T>) -> Result<Self, Self::Error> {
         if parts.metered_size() > caps::RECORD_BATCH_MAX.bytes {
             Err("record must have metered size less than 1 MiB")
         } else {
@@ -219,9 +224,9 @@ impl TryFrom<AppendRecordParts> for AppendRecord {
 }
 
 #[derive(Clone)]
-pub struct AppendRecordBatch(Metered<Vec<AppendRecord>>);
+pub struct AppendRecordBatch<T = Record>(Metered<Vec<AppendRecord<T>>>);
 
-impl std::fmt::Debug for AppendRecordBatch {
+impl<T> std::fmt::Debug for AppendRecordBatch<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppendRecordBatch")
             .field("num_records", &self.0.len())
@@ -230,24 +235,24 @@ impl std::fmt::Debug for AppendRecordBatch {
     }
 }
 
-impl MeteredSize for AppendRecordBatch {
+impl<T> MeteredSize for AppendRecordBatch<T> {
     fn metered_size(&self) -> usize {
         self.0.metered_size()
     }
 }
 
-impl std::ops::Deref for AppendRecordBatch {
-    type Target = [AppendRecord];
+impl<T> std::ops::Deref for AppendRecordBatch<T> {
+    type Target = [AppendRecord<T>];
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl TryFrom<Metered<Vec<AppendRecord>>> for AppendRecordBatch {
+impl<T> TryFrom<Metered<Vec<AppendRecord<T>>>> for AppendRecordBatch<T> {
     type Error = &'static str;
 
-    fn try_from(records: Metered<Vec<AppendRecord>>) -> Result<Self, Self::Error> {
+    fn try_from(records: Metered<Vec<AppendRecord<T>>>) -> Result<Self, Self::Error> {
         if records.is_empty() {
             return Err("record batch must not be empty");
         }
@@ -264,17 +269,17 @@ impl TryFrom<Metered<Vec<AppendRecord>>> for AppendRecordBatch {
     }
 }
 
-impl TryFrom<Vec<AppendRecord>> for AppendRecordBatch {
+impl<T> TryFrom<Vec<AppendRecord<T>>> for AppendRecordBatch<T> {
     type Error = &'static str;
 
-    fn try_from(records: Vec<AppendRecord>) -> Result<Self, Self::Error> {
+    fn try_from(records: Vec<AppendRecord<T>>) -> Result<Self, Self::Error> {
         let records = Metered::from(records);
         Self::try_from(records)
     }
 }
 
-impl IntoIterator for AppendRecordBatch {
-    type Item = AppendRecord;
+impl<T> IntoIterator for AppendRecordBatch<T> {
+    type Item = AppendRecord<T>;
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -282,11 +287,87 @@ impl IntoIterator for AppendRecordBatch {
     }
 }
 
+pub type StoredAppendRecord = AppendRecord<StoredRecord>;
+pub type StoredAppendRecordParts = AppendRecordParts<StoredRecord>;
+pub type StoredAppendRecordBatch = AppendRecordBatch<StoredRecord>;
+
+impl From<AppendRecordParts<Record>> for AppendRecordParts<StoredRecord> {
+    fn from(
+        AppendRecordParts { timestamp, record }: AppendRecordParts<Record>,
+    ) -> AppendRecordParts<StoredRecord> {
+        AppendRecordParts {
+            timestamp,
+            record: StoredRecord::from(record.into_inner()).into(),
+        }
+    }
+}
+
+impl From<AppendRecord<Record>> for AppendRecord<StoredRecord> {
+    fn from(record: AppendRecord<Record>) -> Self {
+        Self(record.into_parts().into())
+    }
+}
+
+impl From<AppendRecordBatch<Record>> for AppendRecordBatch<StoredRecord> {
+    fn from(records: AppendRecordBatch<Record>) -> Self {
+        AppendRecordBatch(
+            records
+                .into_iter()
+                .map(|r| AppendRecord::<StoredRecord>::from(r).metered())
+                .collect(),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct AppendInput {
-    pub records: AppendRecordBatch,
+pub struct AppendInput<T = Record> {
+    pub records: AppendRecordBatch<T>,
     pub match_seq_num: Option<SeqNum>,
     pub fencing_token: Option<FencingToken>,
+}
+
+impl AppendInput<Record> {
+    pub fn encrypt(self, encryption: &EncryptionSpec, aad: &[u8]) -> AppendInput<StoredRecord> {
+        let AppendInput {
+            records,
+            match_seq_num,
+            fencing_token,
+        } = self;
+        let records = AppendRecordBatch(
+            records
+                .into_iter()
+                .map(|record| {
+                    let AppendRecordParts { timestamp, record } = record.into_parts();
+                    let record = encrypt_record(record, encryption, aad);
+                    AppendRecord(AppendRecordParts { timestamp, record }).metered()
+                })
+                .collect(),
+        );
+
+        AppendInput {
+            records,
+            match_seq_num,
+            fencing_token,
+        }
+    }
+}
+
+pub type StoredAppendInput = AppendInput<StoredRecord>;
+
+impl From<AppendInput<Record>> for AppendInput<StoredRecord> {
+    fn from(value: AppendInput<Record>) -> Self {
+        let AppendInput {
+            records,
+            match_seq_num,
+            fencing_token,
+        } = value;
+        let records = records.into();
+        AppendInput {
+            records,
+            match_seq_num,
+            fencing_token,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -335,13 +416,25 @@ impl ReadEnd {
     }
 }
 
-#[derive(Default, Clone)]
-pub struct ReadBatch {
-    pub records: Metered<Vec<SequencedRecord>>,
+#[derive(Clone)]
+pub struct ReadBatch<T = Record> {
+    pub records: Metered<Vec<Sequenced<T>>>,
     pub tail: Option<StreamPosition>,
 }
 
-impl std::fmt::Debug for ReadBatch {
+impl<T> Default for ReadBatch<T>
+where
+    T: MeteredSize,
+{
+    fn default() -> Self {
+        Self {
+            records: Metered::default(),
+            tail: None,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for ReadBatch<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadBatch")
             .field("num_records", &self.records.len())
@@ -351,22 +444,65 @@ impl std::fmt::Debug for ReadBatch {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ReadSessionOutput {
-    Heartbeat(StreamPosition),
-    Batch(ReadBatch),
+impl ReadBatch<StoredRecord> {
+    pub fn decrypt(
+        self,
+        encryption: &EncryptionSpec,
+        aad: &[u8],
+    ) -> Result<ReadBatch, RecordDecryptionError> {
+        let records: Result<Metered<Vec<Sequenced<Record>>>, RecordDecryptionError> = self
+            .records
+            .into_inner()
+            .into_iter()
+            .map(|record| {
+                let (position, record) = record.into_parts();
+                decrypt_stored_record(record, encryption, aad)
+                    .map(|record| record.sequenced(position))
+            })
+            .collect();
+
+        Ok(ReadBatch {
+            records: records?,
+            tail: self.tail,
+        })
+    }
 }
+
+pub type StoredReadBatch = ReadBatch<StoredRecord>;
+
+#[derive(Debug, Clone)]
+pub enum ReadSessionOutput<T = Record> {
+    Heartbeat(StreamPosition),
+    Batch(ReadBatch<T>),
+}
+
+impl ReadSessionOutput<StoredRecord> {
+    pub fn decrypt(
+        self,
+        encryption: &EncryptionSpec,
+        aad: &[u8],
+    ) -> Result<ReadSessionOutput, RecordDecryptionError> {
+        match self {
+            Self::Heartbeat(tail) => Ok(ReadSessionOutput::Heartbeat(tail)),
+            Self::Batch(batch) => batch.decrypt(encryption, aad).map(ReadSessionOutput::Batch),
+        }
+    }
+}
+
+pub type StoredReadSessionOutput = ReadSessionOutput<StoredRecord>;
 
 pub type ListStreamsRequest = ListItemsRequest<StreamNamePrefix, StreamNameStartAfter>;
 
 #[cfg(test)]
 mod test {
+    use bytes::Bytes;
     use rstest::rstest;
 
     use super::{
         super::strings::{NameProps, PrefixProps, StartAfterProps},
-        StreamNameStr,
+        *,
     };
+    use crate::record::{EnvelopeRecord, MeteredExt, Record, StoredRecord, StreamPosition};
 
     #[rstest]
     #[case::normal("my-stream".to_owned())]
@@ -416,5 +552,135 @@ mod test {
     fn validate_start_after_err(#[case] start_after: String) {
         StreamNameStr::<StartAfterProps>::validate_str(&start_after)
             .expect_err("expected validation error");
+    }
+
+    const TEST_AAD: &[u8] = b"test-stream-aad";
+
+    fn sample_append_input() -> AppendInput {
+        let record = Record::Envelope(
+            EnvelopeRecord::try_from_parts(vec![], Bytes::from_static(b"hello")).unwrap(),
+        );
+        AppendInput {
+            records: vec![
+                AppendRecord::try_from(AppendRecordParts {
+                    timestamp: Some(42),
+                    record: record.metered(),
+                })
+                .unwrap(),
+            ]
+            .try_into()
+            .unwrap(),
+            match_seq_num: Some(7),
+            fencing_token: Some("fence".parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn append_record_batch_rejects_empty_batches() {
+        let empty_batch: Result<AppendRecordBatch, _> = Vec::<AppendRecord>::new().try_into();
+
+        assert_eq!(empty_batch.unwrap_err(), "record batch must not be empty");
+    }
+
+    #[rstest]
+    #[case::encrypt(true)]
+    #[case::into(false)]
+    fn append_input_to_stored_preserves_metadata(#[case] encrypt: bool) {
+        let encryption = EncryptionSpec::aegis256([0x42; 32]);
+        let mapped = if encrypt {
+            sample_append_input().encrypt(&encryption, TEST_AAD)
+        } else {
+            sample_append_input().into()
+        };
+
+        assert_eq!(mapped.match_seq_num, Some(7));
+        assert_eq!(
+            mapped.fencing_token.as_ref().map(|token| token.as_ref()),
+            Some("fence")
+        );
+
+        let append_record: AppendRecordParts<StoredRecord> = mapped
+            .records
+            .into_iter()
+            .next()
+            .expect("sample append input should contain a single record")
+            .into_parts();
+        assert_eq!(append_record.timestamp, Some(42));
+
+        let stored_record = append_record.record.into_inner();
+        assert_eq!(
+            matches!(&stored_record, StoredRecord::Encrypted { .. }),
+            encrypt
+        );
+
+        let decryption = if encrypt {
+            &encryption
+        } else {
+            &EncryptionSpec::Plain
+        };
+        let decrypted = decrypt_stored_record(stored_record, decryption, TEST_AAD).unwrap();
+        let Record::Envelope(record) = decrypted.into_inner() else {
+            panic!("expected envelope record");
+        };
+        assert_eq!(record.body().as_ref(), b"hello");
+    }
+
+    #[test]
+    fn stored_read_batch_decrypt_preserves_positions_and_tail() {
+        let batch = ReadBatch {
+            records: Metered::from(vec![
+                StoredRecord::Plaintext(Record::Envelope(
+                    EnvelopeRecord::try_from_parts(vec![], Bytes::from_static(b"one")).unwrap(),
+                ))
+                .metered()
+                .sequenced(StreamPosition {
+                    seq_num: 1,
+                    timestamp: 10,
+                })
+                .into_inner(),
+                StoredRecord::Plaintext(Record::Envelope(
+                    EnvelopeRecord::try_from_parts(vec![], Bytes::from_static(b"two")).unwrap(),
+                ))
+                .metered()
+                .sequenced(StreamPosition {
+                    seq_num: 2,
+                    timestamp: 20,
+                })
+                .into_inner(),
+            ]),
+            tail: Some(StreamPosition {
+                seq_num: 3,
+                timestamp: 30,
+            }),
+        };
+
+        let mapped = batch
+            .decrypt(&crate::encryption::EncryptionSpec::Plain, &[])
+            .unwrap();
+        let records = mapped.records.into_inner();
+
+        assert_eq!(
+            mapped.tail,
+            Some(StreamPosition {
+                seq_num: 3,
+                timestamp: 30
+            })
+        );
+        assert_eq!(
+            records[0].position(),
+            &StreamPosition {
+                seq_num: 1,
+                timestamp: 10
+            }
+        );
+        assert_eq!(
+            records[1].position(),
+            &StreamPosition {
+                seq_num: 2,
+                timestamp: 20
+            }
+        );
+        assert!(matches!(records[0].inner(), Record::Envelope(_)));
+        assert!(matches!(records[1].inner(), Record::Envelope(_)));
     }
 }

@@ -9,7 +9,7 @@ use s2_common::{
     },
 };
 use slatedb::{
-    IsolationLevel,
+    IsolationLevel, IterationOrder,
     config::{DurabilityLevel, ScanOptions, WriteOptions},
 };
 use time::OffsetDateTime;
@@ -20,13 +20,16 @@ use super::{
     store::db_txn_get,
     streamer::{doe_arm_delay, retention_age_or_zero},
 };
-use crate::backend::{
-    error::{
-        BasinDeletionPendingError, BasinNotFoundError, CreateStreamError, DeleteStreamError,
-        GetStreamConfigError, ListStreamsError, ReconfigureStreamError, StorageError,
-        StreamAlreadyExistsError, StreamDeletionPendingError, StreamNotFoundError, StreamerError,
+use crate::{
+    backend::{
+        error::{
+            BasinDeletionPendingError, BasinNotFoundError, CreateStreamError, DeleteStreamError,
+            GetStreamConfigError, ListStreamsError, ReconfigureStreamError, StorageError,
+            StreamAlreadyExistsError, StreamDeletionPendingError, StreamNotFoundError,
+            StreamerError,
+        },
+        kv,
     },
-    kv,
     stream_id::StreamId,
 };
 
@@ -53,6 +56,7 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self.db.scan_with_options(key_range, &SCAN_OPTS).await?;
 
@@ -72,6 +76,7 @@ impl Backend {
                 name: stream,
                 created_at: meta.created_at,
                 deleted_at: meta.deleted_at,
+                cipher: meta.cipher,
             });
         }
         Ok(Page::new(streams, has_more))
@@ -136,6 +141,7 @@ impl Backend {
                             name: stream,
                             created_at: existing_meta.created_at,
                             deleted_at: None,
+                            cipher: existing_meta.cipher,
                         }))
                     } else {
                         Err(StreamAlreadyExistsError { basin, stream }.into())
@@ -148,19 +154,24 @@ impl Backend {
         }
 
         let is_reconfigure = existing_meta_opt.is_some();
-        let (resolved, created_at) = match existing_meta_opt {
-            Some(existing) => (existing.config.reconfigure(config), existing.created_at),
+        let (resolved, created_at, cipher) = match existing_meta_opt {
+            Some(existing) => (
+                existing.config.reconfigure(config),
+                existing.created_at,
+                existing.cipher,
+            ),
             None => (
                 OptionalStreamConfig::default().reconfigure(config),
                 OffsetDateTime::now_utc(),
+                basin_meta.config.stream_cipher,
             ),
         };
-        let resolved: OptionalStreamConfig = resolved
-            .merge(basin_meta.config.default_stream_config)
-            .into();
+        let basin_defaults = &basin_meta.config.default_stream_config;
+        let resolved: OptionalStreamConfig = resolved.merge(basin_defaults.clone()).into();
 
         let meta = kv::stream_meta::StreamMeta {
             config: resolved.clone(),
+            cipher,
             created_at,
             deleted_at: None,
             creation_idempotency_key,
@@ -221,6 +232,7 @@ impl Backend {
             name: stream,
             created_at,
             deleted_at: None,
+            cipher,
         };
 
         Ok(if is_reconfigure {
@@ -331,7 +343,7 @@ impl Backend {
         basin: BasinName,
         stream: StreamName,
     ) -> Result<(), DeleteStreamError> {
-        match self.streamer_client(&basin, &stream).await {
+        match self.streamer_client_guarded(&basin, &stream).await {
             Ok(client) => {
                 client.terminal_trim().await?;
             }

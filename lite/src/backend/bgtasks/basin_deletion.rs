@@ -5,7 +5,7 @@ use s2_common::types::{
     stream::{ListStreamsRequest, StreamNamePrefix, StreamNameStartAfter},
 };
 use slatedb::{
-    WriteBatch,
+    IterationOrder, WriteBatch,
     config::{DurabilityLevel, ScanOptions, WriteOptions},
 };
 use tracing::instrument;
@@ -47,6 +47,7 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self
             .db
@@ -164,6 +165,7 @@ mod tests {
     fn stream_meta(deleted_at: Option<OffsetDateTime>) -> kv::stream_meta::StreamMeta {
         kv::stream_meta::StreamMeta {
             config: Default::default(),
+            cipher: None,
             created_at: OffsetDateTime::now_utc(),
             deleted_at,
             creation_idempotency_key: None,

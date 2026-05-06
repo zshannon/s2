@@ -2,11 +2,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use s2_common::{
+    encryption::EncryptionAlgorithm,
     maybe::Maybe,
     types::{
         config::{
-            BasinConfig, OptionalStreamConfig, OptionalTimestampingConfig, RetentionPolicy,
-            StorageClass, StreamReconfiguration, TimestampingMode, TimestampingReconfiguration,
+            BasinConfig, BasinReconfiguration, OptionalStreamConfig, OptionalTimestampingConfig,
+            RetentionPolicy, StorageClass, StreamReconfiguration, TimestampingMode,
+            TimestampingReconfiguration,
         },
         resources::{CreateMode, ListItemsRequestParts, RequestToken},
         stream::{
@@ -71,6 +73,120 @@ async fn test_create_stream_honors_basin_defaults() {
         config.timestamping.mode,
         Some(TimestampingMode::ClientRequire)
     );
+}
+
+#[tokio::test]
+async fn test_create_stream_defaults_to_no_encryption_algorithm() {
+    let backend = create_backend().await;
+    let basin_name =
+        create_test_basin(&backend, "stream-default-enc", BasinConfig::default()).await;
+    let stream_name = create_test_stream(
+        &backend,
+        &basin_name,
+        "stream-default-enc",
+        OptionalStreamConfig::default(),
+    )
+    .await;
+
+    let page = backend
+        .list_streams(basin_name, ListStreamsRequest::default())
+        .await
+        .expect("Failed to list streams");
+    let info = page
+        .values
+        .iter()
+        .find(|info| info.name == stream_name)
+        .expect("stream info should be present");
+    assert_eq!(info.cipher, None);
+}
+
+#[tokio::test]
+async fn test_create_stream_uses_basin_cipher() {
+    let backend = create_backend().await;
+    let basin_name = create_test_basin(
+        &backend,
+        "stream-cipher",
+        BasinConfig {
+            stream_cipher: Some(EncryptionAlgorithm::Aegis256),
+            ..Default::default()
+        },
+    )
+    .await;
+    let stream_name = create_test_stream(
+        &backend,
+        &basin_name,
+        "stream-cipher",
+        OptionalStreamConfig::default(),
+    )
+    .await;
+
+    let page = backend
+        .list_streams(basin_name, ListStreamsRequest::default())
+        .await;
+    let page = page.expect("Failed to list streams");
+    let info = page
+        .values
+        .iter()
+        .find(|info| info.name == stream_name)
+        .expect("stream info should be present");
+    assert_eq!(info.cipher, Some(EncryptionAlgorithm::Aegis256));
+}
+
+#[tokio::test]
+async fn test_existing_stream_keeps_cipher_after_basin_reconfigure() {
+    let backend = create_backend().await;
+    let basin_name = create_test_basin(
+        &backend,
+        "stream-basin-cipher-reconfigure",
+        BasinConfig {
+            stream_cipher: Some(EncryptionAlgorithm::Aegis256),
+            ..Default::default()
+        },
+    )
+    .await;
+    let stream_name = create_test_stream(
+        &backend,
+        &basin_name,
+        "stream-basin-cipher-reconfigure",
+        OptionalStreamConfig::default(),
+    )
+    .await;
+
+    backend
+        .reconfigure_basin(
+            basin_name.clone(),
+            BasinReconfiguration {
+                stream_cipher: Maybe::Specified(Some(EncryptionAlgorithm::Aes256Gcm)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to reconfigure basin");
+
+    let next_stream = create_test_stream(
+        &backend,
+        &basin_name,
+        "stream-basin-cipher-reconfigure-next",
+        OptionalStreamConfig::default(),
+    )
+    .await;
+
+    let page = backend
+        .list_streams(basin_name, ListStreamsRequest::default())
+        .await
+        .expect("Failed to list streams");
+    let original = page
+        .values
+        .iter()
+        .find(|info| info.name == stream_name)
+        .expect("original stream info should be present");
+    let next = page
+        .values
+        .iter()
+        .find(|info| info.name == next_stream)
+        .expect("new stream info should be present");
+    assert_eq!(original.cipher, Some(EncryptionAlgorithm::Aegis256));
+    assert_eq!(next.cipher, Some(EncryptionAlgorithm::Aes256Gcm));
 }
 
 #[tokio::test]
@@ -250,8 +366,7 @@ async fn test_reconfigure_stream_updates_active_streamer() {
         .await
         .expect("Failed to reconfigure stream");
 
-    backend
-        .check_tail(basin_name.clone(), stream_name.clone())
+    check_tail(&backend, basin_name.clone(), stream_name.clone())
         .await
         .expect("Failed to check tail");
 
@@ -260,7 +375,7 @@ async fn test_reconfigure_stream_updates_active_streamer() {
         match_seq_num: None,
         fencing_token: None,
     };
-    let result = backend.append(basin_name, stream_name, input).await;
+    let result = append(&backend, basin_name, stream_name, input, None).await;
     assert!(matches!(result, Err(AppendError::TimestampMissing(_))));
 }
 
@@ -293,8 +408,7 @@ async fn test_create_stream_create_or_reconfigure_updates_active_streamer() {
         .await
         .expect("CreateOrReconfigure should succeed for an existing stream");
 
-    backend
-        .check_tail(basin_name.clone(), stream_name.clone())
+    check_tail(&backend, basin_name.clone(), stream_name.clone())
         .await
         .expect("Failed to check tail");
 
@@ -303,7 +417,7 @@ async fn test_create_stream_create_or_reconfigure_updates_active_streamer() {
         match_seq_num: None,
         fencing_token: None,
     };
-    let result = backend.append(basin_name, stream_name, input).await;
+    let result = append(&backend, basin_name, stream_name, input, None).await;
     assert!(matches!(result, Err(AppendError::TimestampMissing(_))));
 }
 
@@ -398,6 +512,49 @@ async fn test_delete_stream_marks_deleted_and_blocks_recreation() {
 }
 
 #[tokio::test]
+async fn test_delete_stream_allows_plaintext_command_records_on_encrypted_only_stream() {
+    let backend = create_backend().await;
+    let basin_name = create_test_basin(
+        &backend,
+        "stream-delete-encrypted-only",
+        basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+    )
+    .await;
+    let stream_name = create_test_stream(
+        &backend,
+        &basin_name,
+        "stream-delete-encrypted-only",
+        OptionalStreamConfig::default(),
+    )
+    .await;
+
+    append_payloads_with_encryption(
+        &backend,
+        &basin_name,
+        &stream_name,
+        &[b"secret"],
+        &aegis256_encryption_spec(),
+    )
+    .await;
+
+    backend
+        .delete_stream(basin_name.clone(), stream_name.clone())
+        .await
+        .expect("Failed to delete encrypted-only stream");
+
+    let page = backend
+        .list_streams(basin_name, ListStreamsRequest::default())
+        .await
+        .expect("Failed to list streams");
+    let info = page
+        .values
+        .iter()
+        .find(|info| info.name == stream_name)
+        .expect("Deleted stream should appear in listing");
+    assert!(info.deleted_at.is_some());
+}
+
+#[tokio::test]
 async fn test_delete_stream_blocks_data_operations() {
     let backend = create_backend().await;
 
@@ -416,9 +573,7 @@ async fn test_delete_stream_blocks_data_operations() {
         .await
         .expect("Failed to delete stream");
 
-    let tail = backend
-        .check_tail(basin_name.clone(), stream_name.clone())
-        .await;
+    let tail = check_tail(&backend, basin_name.clone(), stream_name.clone()).await;
     assert!(matches!(
         tail,
         Err(CheckTailError::StreamDeletionPending(_))
@@ -429,9 +584,14 @@ async fn test_delete_stream_blocks_data_operations() {
         match_seq_num: None,
         fencing_token: None,
     };
-    let append_result = backend
-        .append(basin_name.clone(), stream_name.clone(), input)
-        .await;
+    let append_result = append(
+        &backend,
+        basin_name.clone(),
+        stream_name.clone(),
+        input,
+        None,
+    )
+    .await;
     assert!(matches!(
         append_result,
         Err(AppendError::StreamDeletionPending(_))
@@ -442,7 +602,7 @@ async fn test_delete_stream_blocks_data_operations() {
         clamp: false,
     };
     let end = ReadEnd::default();
-    let read_result = backend.read(basin_name, stream_name, start, end).await;
+    let read_result = try_open_read_session(&backend, &basin_name, &stream_name, start, end).await;
     assert!(matches!(
         read_result,
         Err(ReadError::StreamDeletionPending(_))
@@ -523,7 +683,17 @@ async fn test_list_streams_multiple() {
         .await
         .expect("Failed to list streams");
 
-    assert_eq!(page.values.len(), 5);
+    let names: Vec<_> = page.values.iter().map(|info| info.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "test-stream-list-0",
+            "test-stream-list-1",
+            "test-stream-list-2",
+            "test-stream-list-3",
+            "test-stream-list-4",
+        ]
+    );
     assert!(!page.has_more);
 }
 
@@ -556,8 +726,18 @@ async fn test_list_streams_pagination() {
         .await
         .expect("Failed to list streams page 1");
 
-    assert_eq!(page1.values.len(), 5);
     assert!(page1.has_more);
+    let page1_names: Vec<_> = page1.values.iter().map(|info| info.name.as_ref()).collect();
+    assert_eq!(
+        page1_names,
+        vec![
+            "test-stream-stream-00",
+            "test-stream-stream-01",
+            "test-stream-stream-02",
+            "test-stream-stream-03",
+            "test-stream-stream-04",
+        ]
+    );
 
     let page2 = backend
         .list_streams(
@@ -573,8 +753,18 @@ async fn test_list_streams_pagination() {
         .await
         .expect("Failed to list streams page 2");
 
-    assert_eq!(page2.values.len(), 5);
     assert!(page2.has_more);
+    let page2_names: Vec<_> = page2.values.iter().map(|info| info.name.as_ref()).collect();
+    assert_eq!(
+        page2_names,
+        vec![
+            "test-stream-stream-05",
+            "test-stream-stream-06",
+            "test-stream-stream-07",
+            "test-stream-stream-08",
+            "test-stream-stream-09",
+        ]
+    );
 
     let page3 = backend
         .list_streams(
@@ -590,8 +780,12 @@ async fn test_list_streams_pagination() {
         .await
         .expect("Failed to list streams page 3");
 
-    assert_eq!(page3.values.len(), 2);
     assert!(!page3.has_more);
+    let page3_names: Vec<_> = page3.values.iter().map(|info| info.name.as_ref()).collect();
+    assert_eq!(
+        page3_names,
+        vec!["test-stream-stream-10", "test-stream-stream-11"]
+    );
 }
 
 #[tokio::test]
@@ -642,11 +836,13 @@ async fn test_list_streams_prefix_filter() {
         .await
         .expect("Failed to list streams with prefix");
 
-    assert_eq!(metrics_streams.values.len(), 2);
-    assert!(
-        metrics_streams
-            .values
-            .iter()
-            .all(|s| s.name.as_ref().starts_with("test-stream-metrics-"))
+    let metric_names: Vec<_> = metrics_streams
+        .values
+        .iter()
+        .map(|info| info.name.as_ref())
+        .collect();
+    assert_eq!(
+        metric_names,
+        vec!["test-stream-metrics-cpu", "test-stream-metrics-memory"]
     );
 }

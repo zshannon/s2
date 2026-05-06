@@ -12,7 +12,7 @@ use crate::{
     session::{self, AppendSession, AppendSessionConfig},
     types::{
         AccessTokenId, AccessTokenInfo, AppendAck, AppendInput, BasinConfig, BasinInfo, BasinName,
-        CreateBasinInput, CreateStreamInput, DeleteBasinInput, DeleteStreamInput,
+        CreateBasinInput, CreateStreamInput, DeleteBasinInput, DeleteStreamInput, EncryptionKey,
         GetAccountMetricsInput, GetBasinMetricsInput, GetStreamMetricsInput, IssueAccessTokenInput,
         ListAccessTokensInput, ListAllAccessTokensInput, ListAllBasinsInput, ListAllStreamsInput,
         ListBasinsInput, ListStreamsInput, Metric, Page, ReadBatch, ReadInput,
@@ -267,6 +267,7 @@ impl S2Basin {
         S2Stream {
             client: self.client.clone(),
             name,
+            encryption: None,
         }
     }
 
@@ -385,9 +386,18 @@ impl S2Basin {
 pub struct S2Stream {
     client: BasinClient,
     name: StreamName,
+    encryption: Option<EncryptionKey>,
 }
 
 impl S2Stream {
+    /// Set the encryption key for this stream handle.
+    pub fn with_encryption_key(self, encryption: EncryptionKey) -> Self {
+        Self {
+            encryption: Some(encryption),
+            ..self
+        }
+    }
+
     /// Check tail position.
     pub async fn check_tail(&self) -> Result<StreamPosition, S2Error> {
         let response = self.client.check_tail(&self.name).await?;
@@ -401,6 +411,7 @@ impl S2Stream {
             .append(
                 &self.name,
                 input.into(),
+                self.encryption.as_ref(),
                 self.client.config.retry.append_retry_policy,
             )
             .await?;
@@ -411,19 +422,38 @@ impl S2Stream {
     pub async fn read(&self, input: ReadInput) -> Result<ReadBatch, S2Error> {
         let batch = self
             .client
-            .read(&self.name, input.start.into(), input.stop.into())
+            .read(
+                &self.name,
+                input.start.into(),
+                input.stop.into(),
+                self.encryption.as_ref(),
+            )
             .await?;
-        Ok(ReadBatch::from_api(batch, input.ignore_command_records))
+        let mut batch = ReadBatch::from_api(batch);
+        if input.ignore_command_records {
+            batch.records.retain(|r| !r.is_command_record());
+        }
+        Ok(batch)
     }
 
     /// Create an append session for submitting [`AppendInput`]s.
     pub fn append_session(&self, config: AppendSessionConfig) -> AppendSession {
-        AppendSession::new(self.client.clone(), self.name.clone(), config)
+        AppendSession::new(
+            self.client.clone(),
+            self.name.clone(),
+            self.encryption.clone(),
+            config,
+        )
     }
 
     /// Create a producer for submitting individual [`AppendRecord`](crate::types::AppendRecord)s.
     pub fn producer(&self, config: ProducerConfig) -> Producer {
-        Producer::new(self.client.clone(), self.name.clone(), config)
+        Producer::new(
+            self.client.clone(),
+            self.name.clone(),
+            self.encryption.clone(),
+            config,
+        )
     }
 
     /// Create a read session.
@@ -431,6 +461,7 @@ impl S2Stream {
         let batches = session::read_session(
             self.client.clone(),
             self.name.clone(),
+            self.encryption.clone(),
             input.start.into(),
             input.stop.into(),
             input.ignore_command_records,

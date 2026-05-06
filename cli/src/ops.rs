@@ -9,8 +9,8 @@ use s2_sdk::{
         AccessTokenId, AccessTokenInfo, AccessTokenScopeInput, AccountMetricSet, AppendAck,
         AppendInput, AppendRecord, AppendRecordBatch, BasinInfo, BasinMetricSet, BasinName,
         BasinReconfiguration, CommandRecord, CreateBasinInput, CreateStreamInput, DeleteBasinInput,
-        DeleteStreamInput, FencingToken, GetAccountMetricsInput, GetBasinMetricsInput,
-        GetStreamMetricsInput, IssueAccessTokenInput, ListAccessTokensInput,
+        DeleteStreamInput, EncryptionKey, FencingToken, GetAccountMetricsInput,
+        GetBasinMetricsInput, GetStreamMetricsInput, IssueAccessTokenInput, ListAccessTokensInput,
         ListAllAccessTokensInput, ListAllBasinsInput, ListAllStreamsInput, ListBasinsInput,
         ListStreamsInput, MeteredBytes, Metric, ReadBatch, ReadFrom, ReadInput, ReadLimits,
         ReadStart, ReadStop, ReconfigureBasinInput, ReconfigureStreamInput, S2DateTime,
@@ -18,6 +18,18 @@ use s2_sdk::{
         Streaming, TimeRange, TimeRangeAndInterval,
     },
 };
+
+fn stream_with_encryption(
+    s2: &S2,
+    uri: S2BasinAndStreamUri,
+    encryption_key: Option<&EncryptionKey>,
+) -> S2Stream {
+    let stream = s2.basin(uri.basin).stream(uri.stream);
+    match encryption_key {
+        Some(encryption_key) => stream.with_encryption_key(encryption_key.clone()),
+        None => stream,
+    }
+}
 
 use crate::{
     cli::{
@@ -82,7 +94,10 @@ pub async fn list_basins(
 }
 
 pub async fn create_basin(s2: &S2, args: CreateBasinArgs) -> Result<BasinInfo, CliError> {
-    let input = CreateBasinInput::new(args.basin.into()).with_config(args.config.into());
+    let mut input = CreateBasinInput::new(args.basin.into()).with_config(args.config.into());
+    if let Some(scope) = args.scope {
+        input = input.with_scope(scope.into());
+    }
     s2.create_basin(input)
         .await
         .map_err(|e| CliError::op(OpKind::CreateBasin, e))
@@ -110,6 +125,9 @@ pub async fn reconfigure_basin(
     let mut reconfig = BasinReconfiguration::new();
     if !args.default_stream_config.is_empty() {
         reconfig = reconfig.with_default_stream_config(args.default_stream_config.into());
+    }
+    if let Some(algorithm) = args.stream_cipher {
+        reconfig = reconfig.with_stream_cipher(algorithm);
     }
     if let Some(val) = args.create_stream_on_append {
         reconfig = reconfig.with_create_stream_on_append(val);
@@ -424,11 +442,14 @@ pub async fn fence(s2: &S2, args: FenceArgs) -> Result<AppendAck, CliError> {
     .await
 }
 
-pub async fn read(s2: &S2, args: &ReadArgs) -> Result<Streaming<ReadBatch>, CliError> {
+pub async fn read(
+    s2: &S2,
+    args: &ReadArgs,
+    encryption_key: Option<&EncryptionKey>,
+) -> Result<Streaming<ReadBatch>, CliError> {
     use std::time::SystemTime;
 
-    let uri = args.uri.clone();
-    let stream = s2.basin(uri.basin).stream(uri.stream);
+    let stream = stream_with_encryption(s2, args.uri.clone(), encryption_key);
 
     let from = match (args.seq_num, args.timestamp, args.tail_offset, args.ago) {
         (Some(seq), None, None, None) => ReadFrom::SeqNum(seq),
@@ -473,6 +494,7 @@ pub fn append<'a, S, E>(
     s2: &'a S2,
     records: S,
     uri: S2BasinAndStreamUri,
+    encryption_key: Option<&'a EncryptionKey>,
     fencing_token: Option<FencingToken>,
     match_seq_num: Option<u64>,
     linger: Duration,
@@ -481,7 +503,7 @@ where
     S: Stream<Item = Result<AppendRecord, E>> + Send + Unpin + 'a,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let stream = s2.basin(uri.basin).stream(uri.stream);
+    let stream = stream_with_encryption(s2, uri, encryption_key);
 
     let batching_config = BatchingConfig::new().with_linger(linger);
     let mut producer_config = ProducerConfig::new().with_batching(batching_config);
@@ -570,9 +592,9 @@ where
 pub async fn tail(
     s2: &S2,
     args: &TailArgs,
+    encryption_key: Option<&EncryptionKey>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<SequencedRecord, CliError>> + Send>>, CliError> {
-    let uri = args.uri.clone();
-    let stream = s2.basin(uri.basin).stream(uri.stream);
+    let stream = stream_with_encryption(s2, args.uri.clone(), encryption_key);
 
     // Use clamp_to_tail to handle empty streams gracefully - if we ask for
     // TailOffset(10) but there are fewer records, clamp to the actual start

@@ -2,7 +2,7 @@ use std::num::NonZeroU8;
 
 use bytes::{Buf, BufMut, Bytes};
 
-use super::{Encodable, Header, InternalRecordError, PublicRecordError};
+use super::{Encodable, Header, MeteredSize, RecordDecodeError, RecordPartsError};
 use crate::deep_size::DeepSize;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -37,6 +37,12 @@ impl DeepSize for EnvelopeRecord {
     }
 }
 
+impl MeteredSize for EnvelopeRecord {
+    fn metered_size(&self) -> usize {
+        8 + (2 * self.headers.len()) + self.encoding_info.headers_total_bytes + self.body.len()
+    }
+}
+
 impl EnvelopeRecord {
     pub fn headers(&self) -> &[Header] {
         &self.headers
@@ -50,7 +56,7 @@ impl EnvelopeRecord {
         (self.headers, self.body)
     }
 
-    pub fn try_from_parts(headers: Vec<Header>, body: Bytes) -> Result<Self, PublicRecordError> {
+    pub fn try_from_parts(headers: Vec<Header>, body: Bytes) -> Result<Self, RecordPartsError> {
         let encoding_info = headers.as_slice().try_into()?;
         Ok(Self {
             headers,
@@ -95,17 +101,17 @@ impl Encodable for EnvelopeRecord {
 }
 
 impl TryFrom<Bytes> for EnvelopeRecord {
-    type Error = InternalRecordError;
+    type Error = RecordDecodeError;
 
     fn try_from(mut buf: Bytes) -> Result<Self, Self::Error> {
         if buf.is_empty() {
-            return Err(InternalRecordError::InvalidValue("HeaderFlag", "missing"));
+            return Err(RecordDecodeError::InvalidValue("HeaderFlag", "missing"));
         }
 
         let flag: HeaderFlag = buf
             .get_u8()
             .try_into()
-            .map_err(|info| InternalRecordError::InvalidValue("HeaderFlag", info))?;
+            .map_err(|info| RecordDecodeError::InvalidValue("HeaderFlag", info))?;
         if flag.num_headers_length_bytes == 0 {
             return Ok(Self {
                 encoding_info: EMPTY_HEADERS_ENCODING_INFO,
@@ -116,26 +122,26 @@ impl TryFrom<Bytes> for EnvelopeRecord {
 
         let num_headers = buf
             .try_get_uint(flag.num_headers_length_bytes as usize)
-            .map_err(|_| InternalRecordError::Truncated("NumHeaders"))?;
+            .map_err(|_| RecordDecodeError::Truncated("NumHeaders"))?;
 
         let mut headers_total_bytes = 0;
         let mut headers: Vec<Header> = Vec::with_capacity(num_headers as usize);
         for _ in 0..num_headers {
             let name_len = buf
                 .try_get_uint(flag.name_length_bytes.get() as usize)
-                .map_err(|_| InternalRecordError::Truncated("HeaderNameLen"))?
+                .map_err(|_| RecordDecodeError::Truncated("HeaderNameLen"))?
                 as usize;
             if buf.remaining() < name_len {
-                return Err(InternalRecordError::Truncated("HeaderName"));
+                return Err(RecordDecodeError::Truncated("HeaderName"));
             }
             let name = buf.split_to(name_len);
 
             let value_len = buf
                 .try_get_uint(flag.value_length_bytes.get() as usize)
-                .map_err(|_| InternalRecordError::Truncated("HeaderValueLen"))?
+                .map_err(|_| RecordDecodeError::Truncated("HeaderValueLen"))?
                 as usize;
             if buf.remaining() < value_len {
-                return Err(InternalRecordError::Truncated("HeaderValue"));
+                return Err(RecordDecodeError::Truncated("HeaderValue"));
             }
             let value = buf.split_to(value_len);
 
@@ -271,7 +277,9 @@ mod test {
 
     use bytes::Bytes;
 
-    use super::{Encodable as _, EnvelopeRecord, Header, HeaderFlag, InternalRecordError};
+    use super::{
+        Encodable as _, EnvelopeRecord, Header, HeaderFlag, MeteredSize, RecordDecodeError,
+    };
 
     fn roundtrip_parts(headers: Vec<Header>, body: Bytes) {
         let encoded: Bytes = EnvelopeRecord::try_from_parts(headers.clone(), body.clone())
@@ -331,6 +339,31 @@ mod test {
                 },
             ],
             Bytes::from("hello"),
+        );
+    }
+
+    #[test]
+    fn metered_size_uses_cached_header_bytes() {
+        let record = EnvelopeRecord::try_from_parts(
+            vec![
+                Header {
+                    name: Bytes::from("alpha"),
+                    value: Bytes::from("1"),
+                },
+                Header {
+                    name: Bytes::from("beta"),
+                    value: Bytes::from("two"),
+                },
+            ],
+            Bytes::from("body"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.metered_size(),
+            8 + (2 * record.headers().len())
+                + ("alpha".len() + "1".len() + "beta".len() + "two".len())
+                + "body".len()
         );
     }
 
@@ -404,7 +437,7 @@ mod test {
             assert!(
                 matches!(
                     EnvelopeRecord::try_from(truncated),
-                    Err(InternalRecordError::Truncated(_))
+                    Err(RecordDecodeError::Truncated(_))
                 ),
                 "expected Truncated error for len {len}"
             );

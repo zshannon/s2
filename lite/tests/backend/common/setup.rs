@@ -1,23 +1,23 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use bytesize::ByteSize;
-use futures::StreamExt;
 use s2_common::{
-    record::{CommandRecord, FencingToken, Metered, Record, SequencedRecord, Timestamp},
+    encryption::{EncryptionAlgorithm, EncryptionKey, EncryptionSpec},
+    record::{CommandRecord, FencingToken, Metered, Record, Timestamp},
     types::{
         basin::BasinName,
         config::{BasinConfig, OptionalStreamConfig},
         resources::CreateMode,
-        stream::{
-            AppendInput, AppendRecord, AppendRecordBatch, AppendRecordParts, ReadSessionOutput,
-            StreamName,
-        },
+        stream::{AppendInput, AppendRecord, AppendRecordBatch, AppendRecordParts, StreamName},
     },
 };
-use s2_lite::backend::{Backend, error::ReadError};
+use s2_lite::backend::Backend;
 use slatedb::{Db, config::Settings, object_store::memory::InMemory};
 use uuid::Uuid;
+
+const TEST_AEGIS256_KEY: [u8; 32] = [0x42; 32];
+const TEST_AES256_GCM_KEY: [u8; 32] = [0x24; 32];
 
 pub async fn create_in_memory_db() -> Db {
     let object_store = Arc::new(InMemory::new());
@@ -46,6 +46,66 @@ pub fn test_stream_name(suffix: &str) -> StreamName {
     format!("test-stream-{}", suffix).parse().unwrap()
 }
 
+pub fn basin_config_with_stream_cipher(stream_cipher: EncryptionAlgorithm) -> BasinConfig {
+    BasinConfig {
+        default_stream_config: OptionalStreamConfig::default(),
+        stream_cipher: Some(stream_cipher),
+        ..Default::default()
+    }
+}
+
+pub fn aegis256_encryption_spec() -> EncryptionSpec {
+    EncryptionSpec::aegis256(TEST_AEGIS256_KEY)
+}
+
+pub fn aegis256_encryption_key() -> EncryptionKey {
+    EncryptionKey::new(TEST_AEGIS256_KEY)
+}
+
+pub fn aes256_gcm_encryption_key() -> EncryptionKey {
+    EncryptionKey::new(TEST_AES256_GCM_KEY)
+}
+
+pub fn encryption_key_for_spec(encryption: &EncryptionSpec) -> Option<EncryptionKey> {
+    match encryption {
+        EncryptionSpec::Plain => None,
+        // Test helpers use fixed key material for encrypted cases.
+        EncryptionSpec::Aegis256(_) => Some(aegis256_encryption_key()),
+        EncryptionSpec::Aes256Gcm(_) => Some(aes256_gcm_encryption_key()),
+    }
+}
+
+pub async fn setup_backend_for_encryption_spec(
+    basin_suffix: &str,
+    stream_suffix: &str,
+    encryption: &EncryptionSpec,
+) -> (Backend, BasinName, StreamName) {
+    match encryption {
+        EncryptionSpec::Plain => {
+            setup_backend_with_stream(basin_suffix, stream_suffix, OptionalStreamConfig::default())
+                .await
+        }
+        EncryptionSpec::Aegis256(_) => {
+            setup_backend_with_basin_and_stream(
+                basin_suffix,
+                stream_suffix,
+                basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+                OptionalStreamConfig::default(),
+            )
+            .await
+        }
+        EncryptionSpec::Aes256Gcm(_) => {
+            setup_backend_with_basin_and_stream(
+                basin_suffix,
+                stream_suffix,
+                basin_config_with_stream_cipher(EncryptionAlgorithm::Aes256Gcm),
+                OptionalStreamConfig::default(),
+            )
+            .await
+        }
+    }
+}
+
 pub fn create_test_record(body: Bytes) -> AppendRecord {
     create_test_record_with_optional_timestamp(body, None)
 }
@@ -55,7 +115,7 @@ pub fn create_test_record_with_optional_timestamp(
     timestamp: Option<Timestamp>,
 ) -> AppendRecord {
     let envelope = s2_common::record::EnvelopeRecord::try_from_parts(vec![], body).unwrap();
-    let record: Metered<Record> = Record::Envelope(envelope).into();
+    let record = Metered::from(Record::Envelope(envelope));
     let parts = AppendRecordParts { timestamp, record };
     parts.try_into().unwrap()
 }
@@ -65,7 +125,7 @@ pub fn create_test_record_with_timestamp(body: Bytes, timestamp: Timestamp) -> A
 }
 
 pub fn create_fencing_command_record(token: FencingToken) -> AppendRecord {
-    let record: Metered<Record> = Record::Command(CommandRecord::Fence(token)).into();
+    let record = Metered::from(Record::Command(CommandRecord::Fence(token)));
     let parts = AppendRecordParts {
         timestamp: None,
         record,
@@ -121,8 +181,23 @@ pub async fn setup_backend_with_stream(
     stream_suffix: &str,
     stream_config: OptionalStreamConfig,
 ) -> (Backend, BasinName, StreamName) {
+    setup_backend_with_basin_and_stream(
+        basin_suffix,
+        stream_suffix,
+        BasinConfig::default(),
+        stream_config,
+    )
+    .await
+}
+
+pub async fn setup_backend_with_basin_and_stream(
+    basin_suffix: &str,
+    stream_suffix: &str,
+    basin_config: BasinConfig,
+    stream_config: OptionalStreamConfig,
+) -> (Backend, BasinName, StreamName) {
     let backend = create_backend().await;
-    let basin_name = create_test_basin(&backend, basin_suffix, BasinConfig::default()).await;
+    let basin_name = create_test_basin(&backend, basin_suffix, basin_config).await;
     let stream_name = create_test_stream(&backend, &basin_name, stream_suffix, stream_config).await;
     (backend, basin_name, stream_name)
 }
@@ -133,19 +208,53 @@ pub async fn append_payloads(
     stream: &StreamName,
     payloads: &[&[u8]],
 ) -> s2_common::types::stream::AppendAck {
+    let encryption = EncryptionSpec::Plain;
+    append_payloads_with_encryption(backend, basin, stream, payloads, &encryption).await
+}
+
+pub async fn append_payloads_with_encryption(
+    backend: &Backend,
+    basin: &BasinName,
+    stream: &StreamName,
+    payloads: &[&[u8]],
+    encryption: &EncryptionSpec,
+) -> s2_common::types::stream::AppendAck {
     let bodies = payloads
         .iter()
         .map(|bytes| Bytes::copy_from_slice(bytes))
-        .collect::<Vec<_>>();
+        .collect();
     let input = AppendInput {
         records: create_test_record_batch(bodies),
         match_seq_num: None,
         fencing_token: None,
     };
     backend
-        .append(basin.clone(), stream.clone(), input)
+        .open_for_append(basin, stream, encryption_key_for_spec(encryption))
+        .await
+        .expect("Failed to open append handle")
+        .append(input)
         .await
         .expect("Failed to append payloads")
+}
+
+pub async fn append_timestamped_payloads(
+    backend: &Backend,
+    basin: &BasinName,
+    stream: &StreamName,
+    payloads: Vec<(Bytes, Timestamp)>,
+) -> s2_common::types::stream::AppendAck {
+    let input = AppendInput {
+        records: create_test_record_batch_with_timestamps(payloads),
+        match_seq_num: None,
+        fencing_token: None,
+    };
+    backend
+        .open_for_append(basin, stream, None)
+        .await
+        .expect("Failed to open append handle")
+        .append(input)
+        .await
+        .expect("Failed to append timestamped payloads")
 }
 
 pub async fn append_repeat(
@@ -158,31 +267,4 @@ pub async fn append_repeat(
     for _ in 0..count {
         append_payloads(backend, basin, stream, &[payload]).await;
     }
-}
-
-pub async fn collect_records<S>(session: &mut Pin<Box<S>>) -> Vec<SequencedRecord>
-where
-    S: futures::Stream<Item = Result<ReadSessionOutput, ReadError>>,
-{
-    let mut records = Vec::new();
-    while let Some(output) = session.as_mut().next().await {
-        match output {
-            Ok(ReadSessionOutput::Batch(batch)) => {
-                records.extend(batch.records.iter().cloned());
-            }
-            Ok(ReadSessionOutput::Heartbeat(_)) => {}
-            Err(e) => panic!("Read error: {:?}", e),
-        }
-    }
-    records
-}
-
-pub fn envelope_bodies(records: &[SequencedRecord]) -> Vec<Vec<u8>> {
-    records
-        .iter()
-        .map(|record| match &record.record {
-            Record::Envelope(envelope) => envelope.body().to_vec(),
-            other => panic!("Unexpected record type: {:?}", other),
-        })
-        .collect()
 }

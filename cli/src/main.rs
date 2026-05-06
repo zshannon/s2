@@ -32,9 +32,9 @@ use record_format::{
 use s2_sdk::{
     S2,
     types::{
-        AppendRetryPolicy, CreateStreamInput, DeleteOnEmptyConfig, DeleteStreamInput, MeteredBytes,
-        Metric, RetentionPolicy, RetryConfig, StreamConfig as SdkStreamConfig, StreamName,
-        TimestampingConfig, TimestampingMode,
+        AppendRetryPolicy, CreateStreamInput, DeleteOnEmptyConfig, DeleteStreamInput,
+        EncryptionKey, MeteredBytes, Metric, RetentionPolicy, RetryConfig,
+        StreamConfig as SdkStreamConfig, StreamName, TimestampingConfig, TimestampingMode,
     },
 };
 use strum::VariantNames;
@@ -151,7 +151,10 @@ async fn run() -> Result<(), CliError> {
     }
 
     let cli_config = load_cli_config()?;
-    let sdk_config = sdk_config(&cli_config)?;
+    let sdk_config = sdk_config(
+        &cli_config,
+        &format!("s2-cli/{}", env!("CARGO_PKG_VERSION")),
+    )?;
     let s2 = S2::new(sdk_config.clone()).map_err(CliError::SdkInit)?;
     let token_source = access_token_source(&cli_config);
     let result: Result<(), CliError> = (async {
@@ -363,6 +366,7 @@ async fn run() -> Result<(), CliError> {
         }
 
         Command::Append(args) => {
+            let encryption_key = resolve_encryption_key(&args.encryption_key)?;
             let records_in = args
                 .input
                 .reader()
@@ -381,6 +385,7 @@ async fn run() -> Result<(), CliError> {
                 &s2,
                 record_stream,
                 args.uri,
+                encryption_key.as_ref(),
                 args.fencing_token,
                 args.match_seq_num,
                 *args.linger,
@@ -423,7 +428,8 @@ async fn run() -> Result<(), CliError> {
         }
 
         Command::Read(args) => {
-            let mut batches = ops::read(&s2, &args).await?;
+            let encryption_key = resolve_encryption_key(&args.encryption_key)?;
+            let mut batches = ops::read(&s2, &args, encryption_key.as_ref()).await?;
             let mut writer = args
                 .output
                 .writer()
@@ -485,7 +491,8 @@ async fn run() -> Result<(), CliError> {
         }
 
         Command::Tail(args) => {
-            let mut records = ops::tail(&s2, &args).await?;
+            let encryption_key = resolve_encryption_key(&args.encryption_key)?;
+            let mut records = ops::tail(&s2, &args, encryption_key.as_ref()).await?;
             let mut writer = args
                 .output
                 .writer()
@@ -794,5 +801,22 @@ fn print_metrics(metrics: &[Metric]) {
                 }
             }
         }
+    }
+}
+
+fn resolve_encryption_key(
+    args: &cli::EncryptionKeyArgs,
+) -> Result<Option<EncryptionKey>, CliError> {
+    match (&args.key, &args.key_file) {
+        (Some(key), _) => Ok(Some(key.clone())),
+        (_, Some(path)) => {
+            let contents = std::fs::read_to_string(path).map_err(|e| {
+                CliError::InvalidArgs(miette::miette!("cannot read encryption key file: {e}"))
+            })?;
+            Ok(Some(contents.trim().parse::<EncryptionKey>().map_err(
+                |e| CliError::InvalidArgs(miette::miette!("{e}")),
+            )?))
+        }
+        _ => Ok(None),
     }
 }

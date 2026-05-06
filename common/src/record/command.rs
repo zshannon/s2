@@ -2,15 +2,17 @@ use std::{fmt, str::Utf8Error};
 
 use bytes::{BufMut, Bytes};
 use compact_str::CompactString;
-use enum_ordinalize::Ordinalize;
+use strum::FromRepr;
 
-use super::{Encodable, FencingTokenTooLongError, InternalRecordError, fencing::FencingToken};
+use super::{
+    Encodable, FencingTokenTooLongError, MeteredSize, RecordDecodeError, fencing::FencingToken,
+};
 use crate::{deep_size::DeepSize, record::SeqNum};
 
 pub const COMMAND_ID_FENCE: &[u8] = b"fence";
 pub const COMMAND_ID_TRIM: &[u8] = b"trim";
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Ordinalize)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, FromRepr)]
 #[repr(u8)]
 pub enum CommandOp {
     Fence,
@@ -56,6 +58,17 @@ impl DeepSize for CommandRecord {
     }
 }
 
+impl MeteredSize for CommandRecord {
+    fn metered_size(&self) -> usize {
+        8 + 2
+            + self.op().to_id().len()
+            + match self {
+                Self::Fence(token) => token.len(),
+                Self::Trim(trim_point) => size_of_val(trim_point),
+            }
+    }
+}
+
 impl CommandRecord {
     pub fn op(&self) -> CommandOp {
         match self {
@@ -92,16 +105,14 @@ impl CommandRecord {
 }
 
 impl TryFrom<&[u8]> for CommandRecord {
-    type Error = InternalRecordError;
+    type Error = RecordDecodeError;
 
     fn try_from(record: &[u8]) -> Result<Self, Self::Error> {
         if record.is_empty() {
-            return Err(InternalRecordError::Truncated("CommandOrdinal"));
+            return Err(RecordDecodeError::Truncated("CommandOrdinal"));
         }
-        let op = CommandOp::from_ordinal(record[0]).ok_or(InternalRecordError::InvalidValue(
-            "CommandOrdinal",
-            "unknown",
-        ))?;
+        let op = CommandOp::from_repr(record[0])
+            .ok_or(RecordDecodeError::InvalidValue("CommandOrdinal", "unknown"))?;
         Self::try_from_parts(op, &record[1..]).map_err(Into::into)
     }
 }
@@ -115,7 +126,7 @@ impl Encodable for CommandRecord {
     }
 
     fn encode_into(&self, buf: &mut impl BufMut) {
-        buf.put_u8(self.op().ordinal());
+        buf.put_u8(self.op() as u8);
         match self {
             CommandRecord::Fence(token) => {
                 buf.put_slice(token.as_bytes());
@@ -137,17 +148,17 @@ pub enum CommandPayloadError {
     TrimPointSize(usize),
 }
 
-impl From<CommandPayloadError> for InternalRecordError {
+impl From<CommandPayloadError> for RecordDecodeError {
     fn from(e: CommandPayloadError) -> Self {
         match e {
             CommandPayloadError::InvalidUtf8(_) => {
-                InternalRecordError::InvalidValue("CommandPayload", "fencing token not valid utf8")
+                RecordDecodeError::InvalidValue("CommandPayload", "fencing token not valid utf8")
             }
             CommandPayloadError::FencingTokenTooLong(_) => {
-                InternalRecordError::InvalidValue("CommandPayload", "fencing token too long")
+                RecordDecodeError::InvalidValue("CommandPayload", "fencing token too long")
             }
             CommandPayloadError::TrimPointSize(_) => {
-                InternalRecordError::InvalidValue("CommandPayload", "trim point size")
+                RecordDecodeError::InvalidValue("CommandPayload", "trim point size")
             }
         }
     }
@@ -156,7 +167,6 @@ impl From<CommandPayloadError> for InternalRecordError {
 #[cfg(test)]
 mod tests {
     use compact_str::ToCompactString;
-    use enum_ordinalize::Ordinalize;
     use proptest::prelude::*;
     use rstest::rstest;
 
@@ -171,9 +181,9 @@ mod tests {
 
     #[test]
     fn command_op_names() {
-        for cmd in CommandOp::VARIANTS {
+        for cmd in [CommandOp::Fence, CommandOp::Trim] {
             let name = cmd.to_id();
-            assert_eq!(CommandOp::from_id(name), Some(*cmd));
+            assert_eq!(CommandOp::from_id(name), Some(cmd));
         }
         assert_eq!(CommandOp::from_id(b""), None);
         assert_eq!(CommandOp::from_id(b"invalid"), None);
@@ -224,6 +234,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metered_size_is_computed_without_materializing_payload() {
+        let fence =
+            CommandRecord::Fence(FencingToken::try_from("fence-me".to_compact_string()).unwrap());
+        assert_eq!(
+            fence.metered_size(),
+            8 + 2 + CommandOp::Fence.to_id().len() + "fence-me".len()
+        );
+
+        let trim = CommandRecord::Trim(42);
+        assert_eq!(
+            trim.metered_size(),
+            8 + 2 + CommandOp::Trim.to_id().len() + size_of_val(&42u64)
+        );
+    }
+
     proptest! {
         #[test]
         fn trim_roundtrip(trim_point in any::<SeqNum>()) {
@@ -238,25 +264,22 @@ mod tests {
         let try_convert = |raw: &[u8]| CommandRecord::try_from(raw);
         assert_eq!(
             try_convert(&[]),
-            Err(InternalRecordError::Truncated("CommandOrdinal"))
+            Err(RecordDecodeError::Truncated("CommandOrdinal"))
         );
         assert_eq!(
             try_convert(&[0xff]),
-            Err(InternalRecordError::InvalidValue(
-                "CommandOrdinal",
-                "unknown"
-            ))
+            Err(RecordDecodeError::InvalidValue("CommandOrdinal", "unknown"))
         );
         assert_eq!(
-            try_convert(&[CommandOp::Fence.ordinal(), 0xff, 0xff]),
-            Err(InternalRecordError::InvalidValue(
+            try_convert(&[CommandOp::Fence as u8, 0xff, 0xff]),
+            Err(RecordDecodeError::InvalidValue(
                 "CommandPayload",
                 "fencing token not valid utf8"
             ))
         );
         assert_eq!(
             try_convert(&[
-                CommandOp::Fence.ordinal(),
+                CommandOp::Fence as u8,
                 b'0',
                 b'1',
                 b'2',
@@ -301,7 +324,7 @@ mod tests {
             Err(CommandPayloadError::FencingTokenTooLong(FencingTokenTooLongError(40)).into())
         );
         assert_eq!(
-            try_convert(&[CommandOp::Trim.ordinal(), 0xff]),
+            try_convert(&[CommandOp::Trim as u8, 0xff]),
             Err(CommandPayloadError::TrimPointSize(1).into())
         );
     }

@@ -1,3 +1,5 @@
+use s2_common::encryption::EncryptionSpec;
+
 pub mod error;
 
 mod auth;
@@ -12,9 +14,16 @@ mod streams;
 
 mod append;
 mod kv;
-mod stream_id;
 
 pub use core::Backend;
+
+pub use crate::stream_id::StreamId;
+
+pub struct StreamHandle {
+    db: slatedb::Db,
+    client: streamer::GuardedStreamerClient,
+    encryption: EncryptionSpec,
+}
 
 pub const FOLLOWER_MAX_LAG: usize = 25;
 

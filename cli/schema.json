@@ -52,6 +52,18 @@
             }
           ]
         },
+        "stream_cipher": {
+          "description": "Encryption algorithm to apply to newly created streams in the basin.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncryptionAlgorithmSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "create_stream_on_append": {
           "description": "Create stream on append if it doesn't exist, using the default stream configuration.",
           "type": [
@@ -197,6 +209,14 @@
       "examples": [
         "1day",
         "2h 30m"
+      ]
+    },
+    "EncryptionAlgorithmSpec": {
+      "description": "Encryption algorithm to apply to newly created streams in the basin.",
+      "type": "string",
+      "enum": [
+        "aegis-256",
+        "aes-256-gcm"
       ]
     },
     "StreamSpec": {

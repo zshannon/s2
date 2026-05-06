@@ -1,16 +1,18 @@
 use axum::{
-    extract::rejection::{JsonRejection, PathRejection, QueryRejection},
+    extract::rejection::{PathRejection, QueryRejection},
     response::{IntoResponse, Response},
 };
 use s2_api::{
-    data::extract::ProtoRejection,
+    data::extract::{JsonExtractionRejection, ProtoRejection},
     v1::{
         self as v1t,
         error::{ErrorCode, ErrorInfo, ErrorResponse, StandardError},
         stream::{AppendInputStreamError, extract::AppendRequestRejection, s2s},
     },
 };
-use s2_common::{http::extract::HeaderRejection, types::ValidationError};
+use s2_common::{
+    http::extract::HeaderRejection, record::RecordDecryptionError, types::ValidationError,
+};
 
 use crate::{
     auth::{AuthorizeError, RevocationError, SignatureError, TokenBuildError, VerifyError},
@@ -31,7 +33,7 @@ pub enum ServiceError {
     #[error(transparent)]
     QueryRejection(#[from] QueryRejection),
     #[error(transparent)]
-    JsonRejection(#[from] JsonRejection),
+    JsonRejection(#[from] JsonExtractionRejection),
     #[error(transparent)]
     ProtoRejection(#[from] ProtoRejection),
     #[error(transparent)]
@@ -169,6 +171,7 @@ impl ServiceError {
                 CreateStreamError::StreamDeletionPending(e) => {
                     standard(ErrorCode::StreamDeletionPending, e.to_string())
                 }
+                CreateStreamError::Validation(e) => standard(ErrorCode::Invalid, e.to_string()),
             },
             ServiceError::GetStreamConfig(e) => match e {
                 GetStreamConfigError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
@@ -198,11 +201,17 @@ impl ServiceError {
                 ReconfigureStreamError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
+                ReconfigureStreamError::BasinNotFound(e) => {
+                    standard(ErrorCode::BasinNotFound, e.to_string())
+                }
                 ReconfigureStreamError::StreamNotFound(e) => {
                     standard(ErrorCode::StreamNotFound, e.to_string())
                 }
                 ReconfigureStreamError::StreamDeletionPending(e) => {
                     standard(ErrorCode::StreamDeletionPending, e.to_string())
+                }
+                ReconfigureStreamError::Validation(e) => {
+                    standard(ErrorCode::Invalid, e.to_string())
                 }
             },
             ServiceError::CheckTail(e) => match e {
@@ -228,6 +237,9 @@ impl ServiceError {
             },
             ServiceError::Append(e) => match e {
                 AppendError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                AppendError::EncryptionSpecResolution(e) => {
+                    standard(ErrorCode::Invalid, e.to_string())
+                }
                 AppendError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -258,9 +270,24 @@ impl ServiceError {
                     } => v1t::stream::AppendConditionFailed::SeqNumMismatch(*assigned_seq_num),
                 }),
                 AppendError::TimestampMissing(e) => standard(ErrorCode::Invalid, e.to_string()),
+                AppendError::MaxSeqNum(e) => standard(ErrorCode::Invalid, e.to_string()),
             },
             ServiceError::Read(e) => match e {
                 ReadError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ReadError::EncryptionSpecResolution(e) => {
+                    standard(ErrorCode::Invalid, e.to_string())
+                }
+                ReadError::RecordDecryption(e) => match e {
+                    RecordDecryptionError::AuthenticationFailed => {
+                        standard(ErrorCode::DecryptionFailed, e.to_string())
+                    }
+                    RecordDecryptionError::AlgorithmMismatch { .. }
+                    | RecordDecryptionError::MalformedEncryptedRecord
+                    | RecordDecryptionError::MeteredSizeMismatch { .. }
+                    | RecordDecryptionError::MalformedDecryptedRecord(_) => {
+                        standard(ErrorCode::Storage, e.to_string())
+                    }
+                },
                 ReadError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }

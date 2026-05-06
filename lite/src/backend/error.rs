@@ -1,7 +1,8 @@
 use std::{ops::RangeTo, sync::Arc};
 
 use s2_common::{
-    record::{FencingToken, SeqNum, StreamPosition},
+    encryption::EncryptionSpecResolutionError,
+    record::{FencingToken, RecordDecryptionError, SeqNum, StreamPosition},
     types::{basin::BasinName, stream::StreamName},
 };
 
@@ -77,11 +78,19 @@ pub struct RequestDroppedError;
 pub struct AppendTimestampRequiredError;
 
 #[derive(Debug, Clone, thiserror::Error)]
+#[error("max assignable sequence number is {max_assignable_seq_num}; attempted {assigned_seq_num}")]
+pub struct MaxSeqNumError {
+    pub first_seq_num: SeqNum,
+    pub assigned_seq_num: SeqNum,
+    pub max_assignable_seq_num: SeqNum,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("transaction conflict occurred – this is usually retriable")]
 pub struct TransactionConflictError;
 
 #[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum StreamerError {
+pub enum StreamerError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -102,6 +111,18 @@ pub(super) enum AppendErrorInternal {
     ConditionFailed(#[from] AppendConditionFailedError),
     #[error(transparent)]
     TimestampMissing(#[from] AppendTimestampRequiredError),
+    #[error(transparent)]
+    MaxSeqNum(#[from] MaxSeqNumError),
+}
+
+impl AppendErrorInternal {
+    pub fn durability_dependency(&self) -> RangeTo<SeqNum> {
+        match self {
+            Self::ConditionFailed(e) => e.durability_dependency(),
+            Self::MaxSeqNum(e) => e.durability_dependency(),
+            _ => ..0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -137,6 +158,8 @@ pub enum AppendError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
+    EncryptionSpecResolution(#[from] EncryptionSpecResolutionError),
+    #[error(transparent)]
     TransactionConflict(#[from] TransactionConflictError),
     #[error(transparent)]
     StreamerMissingInActionError(#[from] StreamerMissingInActionError),
@@ -154,6 +177,8 @@ pub enum AppendError {
     ConditionFailed(#[from] AppendConditionFailedError),
     #[error(transparent)]
     TimestampMissing(#[from] AppendTimestampRequiredError),
+    #[error(transparent)]
+    MaxSeqNum(#[from] MaxSeqNumError),
 }
 
 impl From<AppendErrorInternal> for AppendError {
@@ -166,6 +191,7 @@ impl From<AppendErrorInternal> for AppendError {
             AppendErrorInternal::RequestDroppedError(e) => AppendError::RequestDroppedError(e),
             AppendErrorInternal::ConditionFailed(e) => AppendError::ConditionFailed(e),
             AppendErrorInternal::TimestampMissing(e) => AppendError::TimestampMissing(e),
+            AppendErrorInternal::MaxSeqNum(e) => AppendError::MaxSeqNum(e),
         }
     }
 }
@@ -197,6 +223,12 @@ impl AppendConditionFailedError {
     }
 }
 
+impl MaxSeqNumError {
+    pub fn durability_dependency(&self) -> RangeTo<SeqNum> {
+        ..self.first_seq_num
+    }
+}
+
 impl From<StreamerError> for AppendError {
     fn from(e: StreamerError) -> Self {
         match e {
@@ -211,6 +243,10 @@ impl From<StreamerError> for AppendError {
 pub enum ReadError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    EncryptionSpecResolution(#[from] EncryptionSpecResolutionError),
+    #[error(transparent)]
+    RecordDecryption(#[from] RecordDecryptionError),
     #[error(transparent)]
     TransactionConflict(#[from] TransactionConflictError),
     #[error(transparent)]
@@ -281,6 +317,8 @@ pub enum CreateStreamError {
     StreamAlreadyExists(#[from] StreamAlreadyExistsError),
     #[error(transparent)]
     StreamDeletionPending(#[from] StreamDeletionPendingError),
+    #[error(transparent)]
+    Validation(#[from] s2_common::types::ValidationError),
 }
 
 impl From<slatedb::Error> for CreateStreamError {
@@ -417,9 +455,13 @@ pub enum ReconfigureStreamError {
     #[error(transparent)]
     TransactionConflict(#[from] TransactionConflictError),
     #[error(transparent)]
+    BasinNotFound(#[from] BasinNotFoundError),
+    #[error(transparent)]
     StreamNotFound(#[from] StreamNotFoundError),
     #[error(transparent)]
     StreamDeletionPending(#[from] StreamDeletionPendingError),
+    #[error(transparent)]
+    Validation(#[from] s2_common::types::ValidationError),
 }
 
 impl From<slatedb::Error> for ReconfigureStreamError {

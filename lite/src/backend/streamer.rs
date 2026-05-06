@@ -12,16 +12,21 @@ use futures::{
     FutureExt as _,
     future::{BoxFuture, OptionFuture},
 };
+use parking_lot::Mutex;
 use s2_common::{
+    encryption::EncryptionAlgorithm,
     record::{
         CommandRecord, FencingToken, Metered, MeteredSize, NonZeroSeqNum, Record, SeqNum,
-        SequencedRecord, StreamPosition, Timestamp,
+        StoredRecord, StoredSequencedRecord, StreamPosition, Timestamp,
     },
     types::{
         config::{
             OptionalStreamConfig, OptionalTimestampingConfig, RetentionPolicy, TimestampingMode,
         },
-        stream::{AppendAck, AppendInput, AppendRecord, AppendRecordBatch, AppendRecordParts},
+        stream::{
+            AppendAck, StoredAppendInput, StoredAppendRecord, StoredAppendRecordBatch,
+            StoredAppendRecordParts,
+        },
     },
 };
 use slatedb::{
@@ -40,12 +45,12 @@ use crate::{
         durability_notifier::DurabilityNotifier,
         error::{
             AppendConditionFailedError, AppendErrorInternal, AppendTimestampRequiredError,
-            DeleteStreamError, RequestDroppedError, StreamerMissingInActionError,
+            DeleteStreamError, MaxSeqNumError, RequestDroppedError, StreamerMissingInActionError,
         },
         kv,
-        stream_id::StreamId,
     },
     metrics,
+    stream_id::StreamId,
 };
 
 pub(super) const DORMANT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -66,11 +71,11 @@ pub(super) fn retention_age_or_zero(config: &OptionalStreamConfig) -> Duration {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct StreamerId(u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StreamerGenerationId(u64);
 
-impl StreamerId {
-    fn next() -> Self {
+impl StreamerGenerationId {
+    pub(super) fn next() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
@@ -85,13 +90,133 @@ struct DeleteOnEmptyDeadline {
 #[derive(Debug)]
 struct InFlightAppend {
     db_seq: u64,
-    records: Vec<Metered<SequencedRecord>>,
+    records: Vec<Metered<StoredSequencedRecord>>,
+}
+
+#[derive(Debug, Default)]
+struct LeaseState {
+    active: usize,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct StreamerLeaseState {
+    state: Arc<Mutex<LeaseState>>,
+}
+
+impl StreamerLeaseState {
+    fn new() -> (Self, StreamerClientLeaseState) {
+        let state = Arc::new(Mutex::new(LeaseState::default()));
+        (
+            Self {
+                state: state.clone(),
+            },
+            StreamerClientLeaseState { state },
+        )
+    }
+
+    fn close_if_idle(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.closed {
+            return true;
+        }
+        if state.active == 0 {
+            state.closed = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for StreamerLeaseState {
+    fn drop(&mut self) {
+        self.state.lock().closed = true;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamerClientLeaseState {
+    state: Arc<Mutex<LeaseState>>,
+}
+
+pub(super) struct StreamerClientLeaseGuard {
+    state: Arc<Mutex<LeaseState>>,
+}
+
+impl Drop for StreamerClientLeaseGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        assert!(state.active > 0, "lease count underflow");
+        state.active -= 1;
+    }
+}
+
+impl StreamerClientLeaseState {
+    fn try_acquire(&self) -> Result<StreamerClientLeaseGuard, StreamerMissingInActionError> {
+        {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(StreamerMissingInActionError);
+            }
+            state.active += 1;
+        }
+        Ok(StreamerClientLeaseGuard {
+            state: self.state.clone(),
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
+}
+
+pub(super) struct GuardedStreamerClient {
+    client: StreamerClient,
+    _guard: StreamerClientLeaseGuard,
+}
+
+impl GuardedStreamerClient {
+    pub(super) fn stream_id(&self) -> StreamId {
+        self.client.stream_id
+    }
+
+    pub(super) fn cipher(&self) -> Option<EncryptionAlgorithm> {
+        self.client.cipher
+    }
+
+    pub(super) async fn check_tail(&self) -> Result<StreamPosition, StreamerMissingInActionError> {
+        self.client.check_tail().await
+    }
+
+    pub(super) async fn follow(
+        &self,
+        start_seq_num: SeqNum,
+    ) -> Result<
+        Result<broadcast::Receiver<Vec<Metered<StoredSequencedRecord>>>, StreamPosition>,
+        StreamerMissingInActionError,
+    > {
+        self.client.follow(start_seq_num).await
+    }
+
+    pub(super) async fn append_permit(
+        &self,
+        input: StoredAppendInput,
+    ) -> Result<AppendPermit<'_>, StreamerMissingInActionError> {
+        self.client.append_permit(input).await
+    }
+
+    pub(super) async fn terminal_trim(&self) -> Result<(), DeleteStreamError> {
+        self.client.terminal_trim().await
+    }
 }
 
 pub(super) struct Spawner {
+    pub generation_id: StreamerGenerationId,
     pub db: slatedb::Db,
     pub stream_id: StreamId,
     pub config: OptionalStreamConfig,
+    pub cipher: Option<EncryptionAlgorithm>,
     pub tail_pos: StreamPosition,
     pub fencing_token: FencingToken,
     pub trim_point: RangeTo<SeqNum>,
@@ -101,11 +226,16 @@ pub(super) struct Spawner {
 }
 
 impl Spawner {
-    pub fn spawn(self, on_exit: impl FnOnce(StreamerId) + Send + 'static) -> StreamerClient {
+    pub fn spawn(
+        self,
+        on_exit: impl FnOnce(StreamerGenerationId) + Send + 'static,
+    ) -> StreamerClient {
         let Self {
+            generation_id,
             db,
             stream_id,
             config,
+            cipher,
             tail_pos,
             fencing_token,
             trim_point,
@@ -115,6 +245,7 @@ impl Spawner {
         } = self;
 
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        let (streamer_lease_state, client_lease_state) = StreamerLeaseState::new();
         let streamer = Streamer {
             db,
             stream_id,
@@ -135,23 +266,23 @@ impl Spawner {
             pending_appends: append::PendingAppends::new(),
             stable_pos: tail_pos,
             follow_tx: broadcast::Sender::new(super::FOLLOWER_MAX_LAG),
-            active_followers: 0,
+            lease_state: streamer_lease_state,
             durability_notifier,
             bgtask_trigger_tx,
         };
 
-        let id = StreamerId::next();
-
         tokio::spawn(async move {
             streamer.run(msg_rx).await;
-            on_exit(id);
+            on_exit(generation_id);
         });
 
         StreamerClient {
-            id,
+            generation_id,
             stream_id,
+            cipher,
             msg_tx,
             append_inflight_bytes: append_inflight_bytes_sema,
+            lease_state: client_lease_state,
         }
     }
 }
@@ -187,8 +318,8 @@ struct Streamer {
     inflight_appends: VecDeque<InFlightAppend>,
     pending_appends: append::PendingAppends,
     stable_pos: StreamPosition,
-    follow_tx: broadcast::Sender<Vec<Metered<SequencedRecord>>>,
-    active_followers: usize,
+    follow_tx: broadcast::Sender<Vec<Metered<StoredSequencedRecord>>>,
+    lease_state: StreamerLeaseState,
     durability_notifier: DurabilityNotifier,
     bgtask_trigger_tx: broadcast::Sender<BgtaskTrigger>,
 }
@@ -202,12 +333,12 @@ impl Streamer {
 
     fn sequence_records(
         &self,
-        AppendInput {
+        StoredAppendInput {
             records,
             match_seq_num,
             fencing_token,
-        }: AppendInput,
-    ) -> Result<Vec<Metered<SequencedRecord>>, AppendErrorInternal> {
+        }: StoredAppendInput,
+    ) -> Result<Vec<Metered<StoredSequencedRecord>>, AppendErrorInternal> {
         if let Some(provided_token) = fencing_token
             && provided_token != self.fencing_token.state
         {
@@ -261,7 +392,7 @@ impl Streamer {
 
     fn handle_append(
         &mut self,
-        input: AppendInput,
+        input: StoredAppendInput,
         session: Option<append::SessionHandle>,
         reply_tx: oneshot::Sender<Result<AppendAck, AppendErrorInternal>>,
         append_type: AppendType,
@@ -276,13 +407,13 @@ impl Streamer {
                 if append_type == AppendType::Terminal {
                     assert_eq!(sequenced_records.len(), 1);
                     assert_eq!(
-                        sequenced_records[0].record,
-                        Record::Command(CommandRecord::Trim(SeqNum::MAX))
+                        sequenced_records[0].inner(),
+                        &StoredRecord::Plaintext(Record::Command(CommandRecord::Trim(SeqNum::MAX)))
                     );
                 }
                 for sr in sequenced_records.iter() {
-                    if let Record::Command(cmd) = &sr.record {
-                        self.apply_command(sr.position.seq_num, cmd, append_type);
+                    if let StoredRecord::Plaintext(Record::Command(cmd)) = sr.inner() {
+                        self.apply_command(sr.position().seq_num, cmd, append_type);
                     }
                 }
                 let (first_pos, next_pos) = pos_span(&sequenced_records);
@@ -415,7 +546,12 @@ impl Streamer {
                             append_type,
                         } => {
                             if self.trim_point.state.end < SeqNum::MAX {
-                                self.handle_append(input, session, reply_tx, append_type);
+                                self.handle_append(
+                                    input,
+                                    session,
+                                    reply_tx,
+                                    append_type,
+                                );
                             }
                         }
                         Message::Follow {
@@ -423,13 +559,7 @@ impl Streamer {
                             reply_tx,
                         } => {
                             let reply = if start_seq_num == self.stable_pos.seq_num {
-                                self.active_followers += 1;
-                                Ok(FollowReceiver {
-                                    _guard: FollowGuard {
-                                        msg_tx: self.msg_tx.clone(),
-                                    },
-                                    rx: self.follow_tx.subscribe(),
-                                })
+                                Ok(self.follow_tx.subscribe())
                             } else {
                                 Err(self.stable_pos)
                             };
@@ -440,10 +570,6 @@ impl Streamer {
                         }
                         Message::Reconfigure { config } => {
                             self.config = config;
-                        }
-                        Message::FollowerDropped => {
-                            assert!(self.active_followers > 0, "follow guard count underflow");
-                            self.active_followers -= 1;
                         }
                         Message::DurabilityStatus(status) => {
                             match status {
@@ -464,7 +590,7 @@ impl Streamer {
                     }
                 }
                 _ = dormancy.as_mut() => {
-                    if self.active_followers == 0 {
+                    if self.lease_state.close_if_idle() {
                         break;
                     }
                 }
@@ -475,14 +601,16 @@ impl Streamer {
 
 enum Message {
     Append {
-        input: AppendInput,
+        input: StoredAppendInput,
         session: Option<append::SessionHandle>,
         reply_tx: oneshot::Sender<Result<AppendAck, AppendErrorInternal>>,
         append_type: AppendType,
     },
     Follow {
         start_seq_num: SeqNum,
-        reply_tx: oneshot::Sender<Result<FollowReceiver, StreamPosition>>,
+        reply_tx: oneshot::Sender<
+            Result<broadcast::Receiver<Vec<Metered<StoredSequencedRecord>>>, StreamPosition>,
+        >,
     },
     CheckTail {
         reply_tx: oneshot::Sender<StreamPosition>,
@@ -490,55 +618,37 @@ enum Message {
     Reconfigure {
         config: OptionalStreamConfig,
     },
-    FollowerDropped,
     DurabilityStatus(Result<u64, slatedb::CloseReason>),
-}
-
-pub(super) struct FollowReceiver {
-    _guard: FollowGuard,
-    rx: broadcast::Receiver<Vec<Metered<SequencedRecord>>>,
-}
-
-impl FollowReceiver {
-    pub async fn recv(
-        &mut self,
-    ) -> Result<Vec<Metered<SequencedRecord>>, broadcast::error::RecvError> {
-        self.rx.recv().await
-    }
-}
-
-struct FollowGuard {
-    msg_tx: mpsc::UnboundedSender<Message>,
-}
-
-impl Drop for FollowGuard {
-    fn drop(&mut self) {
-        let _ = self.msg_tx.send(Message::FollowerDropped);
-    }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct StreamerClient {
-    id: StreamerId,
+    generation_id: StreamerGenerationId,
     stream_id: StreamId,
+    cipher: Option<EncryptionAlgorithm>,
     msg_tx: mpsc::UnboundedSender<Message>,
     append_inflight_bytes: Arc<Semaphore>,
+    lease_state: StreamerClientLeaseState,
 }
 
 impl StreamerClient {
-    pub fn id(&self) -> StreamerId {
-        self.id
+    pub(super) fn generation_id(&self) -> StreamerGenerationId {
+        self.generation_id
     }
 
-    pub fn is_dead(&self) -> bool {
-        self.msg_tx.is_closed()
+    pub(super) fn is_dead(&self) -> bool {
+        self.lease_state.is_closed()
     }
 
-    pub fn stream_id(&self) -> StreamId {
-        self.stream_id
+    pub(super) fn guard(self) -> Result<GuardedStreamerClient, StreamerMissingInActionError> {
+        let _guard = self.lease_state.try_acquire()?;
+        Ok(GuardedStreamerClient {
+            client: self,
+            _guard,
+        })
     }
 
-    pub async fn check_tail(&self) -> Result<StreamPosition, StreamerMissingInActionError> {
+    async fn check_tail(&self) -> Result<StreamPosition, StreamerMissingInActionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.msg_tx
             .send(Message::CheckTail { reply_tx })
@@ -546,10 +656,13 @@ impl StreamerClient {
         reply_rx.await.map_err(|_| StreamerMissingInActionError)
     }
 
-    pub async fn follow(
+    async fn follow(
         &self,
         start_seq_num: SeqNum,
-    ) -> Result<Result<FollowReceiver, StreamPosition>, StreamerMissingInActionError> {
+    ) -> Result<
+        Result<broadcast::Receiver<Vec<Metered<StoredSequencedRecord>>>, StreamPosition>,
+        StreamerMissingInActionError,
+    > {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.msg_tx
             .send(Message::Follow {
@@ -560,9 +673,9 @@ impl StreamerClient {
         reply_rx.await.map_err(|_| StreamerMissingInActionError)
     }
 
-    pub async fn append_permit(
+    async fn append_permit(
         &self,
-        input: AppendInput,
+        input: StoredAppendInput,
     ) -> Result<AppendPermit<'_>, StreamerMissingInActionError> {
         let metered_size = input.records.metered_size();
         metrics::observe_append_batch_size(input.records.len(), metered_size);
@@ -585,18 +698,18 @@ impl StreamerClient {
         })
     }
 
-    pub fn advise_reconfig(&self, config: OptionalStreamConfig) -> bool {
+    pub(super) fn advise_reconfig(&self, config: OptionalStreamConfig) -> bool {
         self.msg_tx.send(Message::Reconfigure { config }).is_ok()
     }
 
-    pub async fn terminal_trim(&self) -> Result<(), DeleteStreamError> {
-        let record: AppendRecord = AppendRecordParts {
+    async fn terminal_trim(&self) -> Result<(), DeleteStreamError> {
+        let record: StoredAppendRecord = StoredAppendRecordParts {
             timestamp: Some(Timestamp::MAX),
             record: Record::Command(CommandRecord::Trim(SeqNum::MAX)).into(),
         }
         .try_into()
         .expect("valid append record");
-        let input = AppendInput {
+        let input = StoredAppendInput {
             records: vec![record].try_into().expect("valid append batch"),
             match_seq_num: None,
             fencing_token: None,
@@ -618,6 +731,9 @@ impl StreamerClient {
                 }
                 AppendErrorInternal::ConditionFailed(_) => unreachable!("unconditional write"),
                 AppendErrorInternal::TimestampMissing(_) => unreachable!("Timestamp::MAX used"),
+                AppendErrorInternal::MaxSeqNum(_) => {
+                    unreachable!("terminal append is plaintext command record")
+                }
             }),
         }
     }
@@ -636,7 +752,7 @@ fn timestamp_now() -> Timestamp {
 pub struct AppendPermit<'a> {
     sema_permit: SemaphorePermit<'a>,
     msg_tx: &'a mpsc::UnboundedSender<Message>,
-    input: AppendInput,
+    input: StoredAppendInput,
 }
 
 impl AppendPermit<'_> {
@@ -679,21 +795,15 @@ impl AppendPermit<'_> {
     }
 }
 
-fn pos_span<T>(records: &[T]) -> (StreamPosition, StreamPosition)
-where
-    T: std::ops::Deref<Target = SequencedRecord>,
-{
+fn pos_span(records: &[Metered<StoredSequencedRecord>]) -> (StreamPosition, StreamPosition) {
     (
-        records.first().expect("non-empty").position,
+        *records.first().expect("non-empty").position(),
         next_pos(records),
     )
 }
 
-pub fn next_pos<T>(records: &[T]) -> StreamPosition
-where
-    T: std::ops::Deref<Target = SequencedRecord>,
-{
-    let last_pos = records.last().expect("non-empty").position;
+pub fn next_pos(records: &[Metered<StoredSequencedRecord>]) -> StreamPosition {
+    let last_pos = records.last().expect("non-empty").position();
     StreamPosition {
         seq_num: last_pos.seq_num + 1,
         timestamp: last_pos.timestamp,
@@ -701,19 +811,31 @@ where
 }
 
 fn sequenced_records(
-    batch: AppendRecordBatch,
+    batch: StoredAppendRecordBatch,
     first_seq_num: SeqNum,
     prev_max_timestamp: Timestamp,
     config: &OptionalTimestampingConfig,
-) -> Result<Vec<Metered<SequencedRecord>>, AppendErrorInternal> {
+) -> Result<Vec<Metered<StoredSequencedRecord>>, AppendErrorInternal> {
     let mode = config.mode.unwrap_or_default();
     let uncapped = config.uncapped.unwrap_or_default();
     let mut sequenced_records = Vec::with_capacity(batch.len());
     let mut max_timestamp = prev_max_timestamp;
     let now = timestamp_now();
-    for (i, AppendRecordParts { timestamp, record }) in
-        batch.into_iter().map(Into::into).enumerate()
+    for (i, StoredAppendRecordParts { timestamp, record }) in batch
+        .into_iter()
+        .map(|record| record.into_parts())
+        .enumerate()
     {
+        let assigned_seq_num = first_seq_num + i as u64;
+
+        let max_assignable_seq_num = record.as_ref().into_inner().max_assignable_seq_num();
+        if assigned_seq_num > max_assignable_seq_num {
+            Err(MaxSeqNumError {
+                first_seq_num,
+                assigned_seq_num,
+                max_assignable_seq_num,
+            })?;
+        }
         let mut timestamp = match mode {
             TimestampingMode::ClientPrefer => timestamp.unwrap_or(now),
             TimestampingMode::ClientRequire => timestamp.ok_or(AppendTimestampRequiredError)?,
@@ -729,7 +851,7 @@ fn sequenced_records(
         }
 
         sequenced_records.push(record.sequenced(StreamPosition {
-            seq_num: first_seq_num + i as u64,
+            seq_num: assigned_seq_num,
             timestamp,
         }));
     }
@@ -741,7 +863,7 @@ async fn db_submit_append(
     stream_id: StreamId,
     retention: RetentionPolicy,
     doe_deadline: Option<DeleteOnEmptyDeadline>,
-    records: Vec<Metered<SequencedRecord>>,
+    records: Vec<Metered<StoredSequencedRecord>>,
     fencing_token: Option<FencingToken>,
     trim_point: Option<RangeTo<SeqNum>>,
 ) -> Result<InFlightAppend, slatedb::Error> {
@@ -802,18 +924,45 @@ mod tests {
 
     use bytes::Bytes;
     use s2_common::{
-        record::{EnvelopeRecord, Metered, Record},
-        types::stream::{AppendRecord, AppendRecordParts},
+        encryption::EncryptionSpec,
+        record::{EnvelopeRecord, Metered, Record, StoredRecord},
+        types::stream::{
+            StoredAppendInput, StoredAppendRecord, StoredAppendRecordBatch, StoredAppendRecordParts,
+        },
     };
     use slatedb::object_store::memory::InMemory;
     use tokio::sync::{broadcast, mpsc, oneshot};
 
     use super::*;
 
-    fn test_record(body: Bytes, timestamp: Option<Timestamp>) -> AppendRecord {
+    fn test_record(body: Bytes, timestamp: Option<Timestamp>) -> StoredAppendRecord {
         let envelope = EnvelopeRecord::try_from_parts(vec![], body).unwrap();
-        let record: Metered<Record> = Record::Envelope(envelope).into();
-        let parts = AppendRecordParts { timestamp, record };
+        let record = Metered::from(StoredRecord::from(Record::Envelope(envelope)));
+        let parts = StoredAppendRecordParts { timestamp, record };
+        parts.try_into().unwrap()
+    }
+
+    fn test_command_record(
+        command: CommandRecord,
+        timestamp: Option<Timestamp>,
+    ) -> StoredAppendRecord {
+        let record = Metered::from(StoredRecord::from(Record::Command(command)));
+        let parts = StoredAppendRecordParts { timestamp, record };
+        parts.try_into().unwrap()
+    }
+
+    fn test_encrypted_record(
+        body: Bytes,
+        timestamp: Option<Timestamp>,
+        encryption: &EncryptionSpec,
+    ) -> StoredAppendRecord {
+        let envelope = EnvelopeRecord::try_from_parts(vec![], body).unwrap();
+        let record = s2_common::record::encrypt_record(
+            Metered::from(Record::Envelope(envelope)),
+            encryption,
+            b"test-streamer",
+        );
+        let parts = StoredAppendRecordParts { timestamp, record };
         parts.try_into().unwrap()
     }
 
@@ -824,7 +973,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), Some(900)),
             test_record(vec![4, 5, 6].into(), Some(950)),
         ]
@@ -834,10 +983,10 @@ mod tests {
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].position.seq_num, 100);
-        assert_eq!(result[0].position.timestamp, 900);
-        assert_eq!(result[1].position.seq_num, 101);
-        assert_eq!(result[1].position.timestamp, 950);
+        assert_eq!(result[0].position().seq_num, 100);
+        assert_eq!(result[0].position().timestamp, 900);
+        assert_eq!(result[1].position().seq_num, 101);
+        assert_eq!(result[1].position().timestamp, 950);
     }
 
     #[test]
@@ -848,7 +997,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), None),
             test_record(vec![4, 5, 6].into(), None),
         ]
@@ -858,10 +1007,10 @@ mod tests {
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].position.seq_num, 100);
-        assert!(result[0].position.timestamp >= now);
-        assert_eq!(result[1].position.seq_num, 101);
-        assert!(result[1].position.timestamp >= now);
+        assert_eq!(result[0].position().seq_num, 100);
+        assert!(result[0].position().timestamp >= now);
+        assert_eq!(result[1].position().seq_num, 101);
+        assert!(result[1].position().timestamp >= now);
     }
 
     #[test]
@@ -871,7 +1020,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![test_record(vec![1, 2, 3].into(), None)]
+        let records: StoredAppendRecordBatch = vec![test_record(vec![1, 2, 3].into(), None)]
             .try_into()
             .unwrap();
 
@@ -890,7 +1039,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), Some(900)),
             test_record(vec![4, 5, 6].into(), Some(950)),
         ]
@@ -900,8 +1049,8 @@ mod tests {
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].position.timestamp, 900);
-        assert_eq!(result[1].position.timestamp, 950);
+        assert_eq!(result[0].position().timestamp, 900);
+        assert_eq!(result[1].position().timestamp, 950);
     }
 
     #[test]
@@ -912,7 +1061,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), Some(900)),
             test_record(vec![4, 5, 6].into(), Some(950)),
         ]
@@ -922,8 +1071,8 @@ mod tests {
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 2);
-        assert!(result[0].position.timestamp >= now);
-        assert!(result[1].position.timestamp >= now);
+        assert!(result[0].position().timestamp >= now);
+        assert!(result[1].position().timestamp >= now);
     }
 
     #[test]
@@ -933,7 +1082,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), Some(1000)),
             test_record(vec![4, 5, 6].into(), Some(900)),
             test_record(vec![7, 8, 9].into(), Some(1100)),
@@ -944,9 +1093,9 @@ mod tests {
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].position.timestamp, 1000);
-        assert_eq!(result[1].position.timestamp, 1000);
-        assert_eq!(result[2].position.timestamp, 1100);
+        assert_eq!(result[0].position().timestamp, 1000);
+        assert_eq!(result[1].position().timestamp, 1000);
+        assert_eq!(result[2].position().timestamp, 1100);
     }
 
     #[test]
@@ -956,7 +1105,7 @@ mod tests {
             uncapped: Some(false),
         };
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1, 2, 3].into(), Some(500)),
             test_record(vec![4, 5, 6].into(), Some(600)),
         ]
@@ -966,8 +1115,8 @@ mod tests {
         let result = sequenced_records(records, 100, 1000, &config).unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].position.timestamp, 1000);
-        assert_eq!(result[1].position.timestamp, 1000);
+        assert_eq!(result[0].position().timestamp, 1000);
+        assert_eq!(result[1].position().timestamp, 1000);
     }
 
     #[test]
@@ -979,14 +1128,15 @@ mod tests {
         };
 
         let future = now + 10_000;
-        let records: AppendRecordBatch = vec![test_record(vec![1, 2, 3].into(), Some(future))]
-            .try_into()
-            .unwrap();
+        let records: StoredAppendRecordBatch =
+            vec![test_record(vec![1, 2, 3].into(), Some(future))]
+                .try_into()
+                .unwrap();
 
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert!(result[0].position.timestamp <= now + 100);
+        assert!(result[0].position().timestamp <= now + 100);
     }
 
     #[test]
@@ -998,21 +1148,22 @@ mod tests {
         };
 
         let future = now + 10_000;
-        let records: AppendRecordBatch = vec![test_record(vec![1, 2, 3].into(), Some(future))]
-            .try_into()
-            .unwrap();
+        let records: StoredAppendRecordBatch =
+            vec![test_record(vec![1, 2, 3].into(), Some(future))]
+                .try_into()
+                .unwrap();
 
         let result = sequenced_records(records, 100, 0, &config).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].position.timestamp, future);
+        assert_eq!(result[0].position().timestamp, future);
     }
 
     #[test]
     fn sequenced_records_seq_num_assignment() {
         let config = OptionalTimestampingConfig::default();
 
-        let records: AppendRecordBatch = vec![
+        let records: StoredAppendRecordBatch = vec![
             test_record(vec![1].into(), None),
             test_record(vec![2].into(), None),
             test_record(vec![3].into(), None),
@@ -1023,9 +1174,65 @@ mod tests {
         let result = sequenced_records(records, 42, 0, &config).unwrap();
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].position.seq_num, 42);
-        assert_eq!(result[1].position.seq_num, 43);
-        assert_eq!(result[2].position.seq_num, 44);
+        assert_eq!(result[0].position().seq_num, 42);
+        assert_eq!(result[1].position().seq_num, 43);
+        assert_eq!(result[2].position().seq_num, 44);
+    }
+
+    #[test]
+    fn sequenced_records_reject_aes256gcm_records_past_random_nonce_limit() {
+        let config = OptionalTimestampingConfig::default();
+        let first_record = test_encrypted_record(
+            vec![1, 2, 3].into(),
+            None,
+            &EncryptionSpec::aes256_gcm([0x24; 32]),
+        );
+        let max_assignable_seq_num = first_record.parts().record.max_assignable_seq_num();
+        let first_rejected_seq_num = max_assignable_seq_num + 1;
+        let records: StoredAppendRecordBatch = vec![
+            first_record,
+            test_encrypted_record(
+                vec![4, 5, 6].into(),
+                None,
+                &EncryptionSpec::aes256_gcm([0x24; 32]),
+            ),
+        ]
+        .try_into()
+        .unwrap();
+
+        let result = sequenced_records(records, max_assignable_seq_num, 0, &config);
+
+        assert!(matches!(
+            result,
+            Err(AppendErrorInternal::MaxSeqNum(error))
+                if error.first_seq_num == max_assignable_seq_num
+                    && error.assigned_seq_num == first_rejected_seq_num
+                    && error.max_assignable_seq_num == max_assignable_seq_num
+        ));
+    }
+
+    #[test]
+    fn sequenced_records_allow_aes256gcm_command_records_past_random_nonce_limit() {
+        let config = OptionalTimestampingConfig::default();
+        let max_assignable_seq_num = test_encrypted_record(
+            vec![1, 2, 3].into(),
+            None,
+            &EncryptionSpec::aes256_gcm([0x24; 32]),
+        )
+        .parts()
+        .record
+        .max_assignable_seq_num();
+
+        let records: StoredAppendRecordBatch =
+            vec![test_command_record(CommandRecord::Trim(42), None)]
+                .try_into()
+                .unwrap();
+
+        let first_command_seq_num = max_assignable_seq_num + 1;
+        let result = sequenced_records(records, first_command_seq_num, 0, &config).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].position().seq_num, first_command_seq_num);
     }
 
     #[test]
@@ -1040,8 +1247,8 @@ mod tests {
         assert!(state.is_applied_in(&(0..5)));
     }
 
-    fn append_input(body: &[u8]) -> AppendInput {
-        AppendInput {
+    fn append_input(body: &[u8]) -> StoredAppendInput {
+        StoredAppendInput {
             records: vec![test_record(Bytes::copy_from_slice(body), None)]
                 .try_into()
                 .expect("valid batch"),
@@ -1058,6 +1265,7 @@ mod tests {
             .expect("db");
         let (msg_tx, _msg_rx) = mpsc::unbounded_channel();
         let (bgtask_trigger_tx, _) = broadcast::channel(16);
+        let (lease_state, _) = StreamerLeaseState::new();
         Streamer {
             db: db.clone(),
             stream_id: [3u8; StreamId::LEN].into(),
@@ -1078,10 +1286,53 @@ mod tests {
             pending_appends: append::PendingAppends::new(),
             stable_pos: StreamPosition::MIN,
             follow_tx: broadcast::Sender::new(super::super::FOLLOWER_MAX_LAG),
-            active_followers: 0,
+            lease_state,
             durability_notifier: DurabilityNotifier::spawn(&db),
             bgtask_trigger_tx,
         }
+    }
+
+    #[test]
+    fn lease_state_closes_when_idle_and_rejects_new_leases() {
+        let (streamer_lease_state, client_lease_state) = StreamerLeaseState::new();
+
+        let lease = client_lease_state
+            .try_acquire()
+            .expect("first lease should succeed");
+        assert!(
+            !streamer_lease_state.close_if_idle(),
+            "an outstanding lease should keep the state open"
+        );
+
+        drop(lease);
+
+        assert!(
+            streamer_lease_state.close_if_idle(),
+            "an idle state should close once dormancy wins"
+        );
+        assert!(client_lease_state.is_closed());
+        assert!(matches!(
+            client_lease_state.try_acquire(),
+            Err(StreamerMissingInActionError)
+        ));
+    }
+
+    #[test]
+    fn streamer_lease_state_drop_blocks_new_leases_while_existing_guard_drops_cleanly() {
+        let (streamer_lease_state, client_lease_state) = StreamerLeaseState::new();
+
+        let lease = client_lease_state
+            .try_acquire()
+            .expect("first lease should succeed");
+        drop(streamer_lease_state);
+
+        assert!(matches!(
+            client_lease_state.try_acquire(),
+            Err(StreamerMissingInActionError)
+        ));
+
+        drop(lease);
+        assert!(client_lease_state.is_closed());
     }
 
     #[tokio::test]
@@ -1143,7 +1394,7 @@ mod tests {
         ));
         let batch1 = follow_rx.recv().await.expect("follow batch 1");
         assert_eq!(batch1.len(), 1);
-        let Record::Envelope(env) = &batch1[0].record else {
+        let StoredRecord::Plaintext(Record::Envelope(env)) = batch1[0].inner() else {
             panic!("expected envelope")
         };
         assert_eq!(env.body().as_ref(), b"p0");
@@ -1160,10 +1411,10 @@ mod tests {
 
         let batch2 = follow_rx.recv().await.expect("follow batch 2");
         let batch3 = follow_rx.recv().await.expect("follow batch 3");
-        let Record::Envelope(env2) = &batch2[0].record else {
+        let StoredRecord::Plaintext(Record::Envelope(env2)) = batch2[0].inner() else {
             panic!("expected envelope")
         };
-        let Record::Envelope(env3) = &batch3[0].record else {
+        let StoredRecord::Plaintext(Record::Envelope(env3)) = batch3[0].inner() else {
             panic!("expected envelope")
         };
         assert_eq!(env2.body().as_ref(), b"p1");
@@ -1206,7 +1457,7 @@ mod tests {
 
         for i in 0..4 {
             let batch = follow_rx.recv().await.expect("follow batch");
-            let Record::Envelope(env) = &batch[0].record else {
+            let StoredRecord::Plaintext(Record::Envelope(env)) = batch[0].inner() else {
                 panic!("expected envelope")
             };
             assert_eq!(env.body(), format!("jump-{i}").as_bytes());

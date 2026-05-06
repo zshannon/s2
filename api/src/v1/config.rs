@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use s2_common::{maybe::Maybe, types};
+use s2_common::{encryption, maybe::Maybe, types};
 use serde::{Deserialize, Serialize};
 
 #[rustfmt::skip]
@@ -255,6 +255,35 @@ impl From<types::config::DeleteOnEmptyReconfiguration> for DeleteOnEmptyReconfig
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub enum EncryptionAlgorithm {
+    /// AEGIS-256 authenticated encryption.
+    #[serde(rename = "aegis-256")]
+    Aegis256,
+    /// AES-256-GCM authenticated encryption.
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+}
+
+impl From<EncryptionAlgorithm> for encryption::EncryptionAlgorithm {
+    fn from(value: EncryptionAlgorithm) -> Self {
+        match value {
+            EncryptionAlgorithm::Aegis256 => Self::Aegis256,
+            EncryptionAlgorithm::Aes256Gcm => Self::Aes256Gcm,
+        }
+    }
+}
+
+impl From<encryption::EncryptionAlgorithm> for EncryptionAlgorithm {
+    fn from(value: encryption::EncryptionAlgorithm) -> Self {
+        match value {
+            encryption::EncryptionAlgorithm::Aegis256 => Self::Aegis256,
+            encryption::EncryptionAlgorithm::Aes256Gcm => Self::Aes256Gcm,
+        }
+    }
+}
+
 #[rustfmt::skip]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -404,6 +433,8 @@ impl From<types::config::StreamReconfiguration> for StreamReconfiguration {
 pub struct BasinConfig {
     /// Default stream configuration.
     pub default_stream_config: Option<StreamConfig>,
+    /// Encryption algorithm to apply to newly created streams in the basin.
+    pub stream_cipher: Option<EncryptionAlgorithm>,
     /// Create stream on append if it doesn't exist, using the default stream configuration.
     #[serde(default)]
     #[cfg_attr(feature = "utoipa", schema(default = false))]
@@ -420,6 +451,7 @@ impl TryFrom<BasinConfig> for types::config::BasinConfig {
     fn try_from(value: BasinConfig) -> Result<Self, Self::Error> {
         let BasinConfig {
             default_stream_config,
+            stream_cipher,
             create_stream_on_append,
             create_stream_on_read,
         } = value;
@@ -429,6 +461,7 @@ impl TryFrom<BasinConfig> for types::config::BasinConfig {
                 Some(config) => config.try_into()?,
                 None => Default::default(),
             },
+            stream_cipher: stream_cipher.map(Into::into),
             create_stream_on_append,
             create_stream_on_read,
         })
@@ -439,12 +472,14 @@ impl From<types::config::BasinConfig> for BasinConfig {
     fn from(value: types::config::BasinConfig) -> Self {
         let types::config::BasinConfig {
             default_stream_config,
+            stream_cipher,
             create_stream_on_append,
             create_stream_on_read,
         } = value;
 
         Self {
             default_stream_config: StreamConfig::to_opt(default_stream_config),
+            stream_cipher: stream_cipher.map(Into::into),
             create_stream_on_append,
             create_stream_on_read,
         }
@@ -459,6 +494,10 @@ pub struct BasinReconfiguration {
     #[serde(default, skip_serializing_if = "Maybe::is_unspecified")]
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<StreamReconfiguration>))]
     pub default_stream_config: Maybe<Option<StreamReconfiguration>>,
+    /// Encryption algorithm to apply to newly created streams in the basin.
+    #[serde(default, skip_serializing_if = "Maybe::is_unspecified")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = Option<EncryptionAlgorithm>))]
+    pub stream_cipher: Maybe<Option<EncryptionAlgorithm>>,
     /// Create a stream on append.
     #[serde(default, skip_serializing_if = "Maybe::is_unspecified")]
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<bool>))]
@@ -475,12 +514,14 @@ impl TryFrom<BasinReconfiguration> for types::config::BasinReconfiguration {
     fn try_from(value: BasinReconfiguration) -> Result<Self, Self::Error> {
         let BasinReconfiguration {
             default_stream_config,
+            stream_cipher,
             create_stream_on_append,
             create_stream_on_read,
         } = value;
 
         Ok(Self {
             default_stream_config: default_stream_config.try_map_opt(TryInto::try_into)?,
+            stream_cipher: stream_cipher.map_opt(Into::into),
             create_stream_on_append: create_stream_on_append.map(Into::into),
             create_stream_on_read: create_stream_on_read.map(Into::into),
         })
@@ -491,12 +532,14 @@ impl From<types::config::BasinReconfiguration> for BasinReconfiguration {
     fn from(value: types::config::BasinReconfiguration) -> Self {
         let types::config::BasinReconfiguration {
             default_stream_config,
+            stream_cipher,
             create_stream_on_append,
             create_stream_on_read,
         } = value;
 
         Self {
             default_stream_config: default_stream_config.map_opt(Into::into),
+            stream_cipher: stream_cipher.map_opt(Into::into),
             create_stream_on_append: create_stream_on_append.map(Into::into),
             create_stream_on_read: create_stream_on_read.map(Into::into),
         }
@@ -540,6 +583,13 @@ mod tests {
         any::<u64>().prop_map(|min_age_secs| DeleteOnEmptyConfig { min_age_secs })
     }
 
+    fn gen_encryption_algorithm() -> impl Strategy<Value = EncryptionAlgorithm> {
+        prop_oneof![
+            Just(EncryptionAlgorithm::Aegis256),
+            Just(EncryptionAlgorithm::Aes256Gcm),
+        ]
+    }
+
     fn gen_stream_config() -> impl Strategy<Value = StreamConfig> {
         (
             proptest::option::of(gen_storage_class()),
@@ -560,13 +610,20 @@ mod tests {
     fn gen_basin_config() -> impl Strategy<Value = BasinConfig> {
         (
             proptest::option::of(gen_stream_config()),
+            proptest::option::of(gen_encryption_algorithm()),
             any::<bool>(),
             any::<bool>(),
         )
             .prop_map(
-                |(default_stream_config, create_stream_on_append, create_stream_on_read)| {
+                |(
+                    default_stream_config,
+                    stream_cipher,
+                    create_stream_on_append,
+                    create_stream_on_read,
+                )| {
                     BasinConfig {
                         default_stream_config,
+                        stream_cipher,
                         create_stream_on_append,
                         create_stream_on_read,
                     }
@@ -617,6 +674,7 @@ mod tests {
     fn gen_basin_reconfiguration() -> impl Strategy<Value = BasinReconfiguration> {
         (
             gen_maybe(gen_stream_reconfiguration()),
+            gen_maybe(gen_encryption_algorithm()),
             prop_oneof![
                 Just(Maybe::Unspecified),
                 any::<bool>().prop_map(Maybe::Specified),
@@ -627,12 +685,16 @@ mod tests {
             ],
         )
             .prop_map(
-                |(default_stream_config, create_stream_on_append, create_stream_on_read)| {
-                    BasinReconfiguration {
-                        default_stream_config,
-                        create_stream_on_append,
-                        create_stream_on_read,
-                    }
+                |(
+                    default_stream_config,
+                    stream_cipher,
+                    create_stream_on_append,
+                    create_stream_on_read,
+                )| BasinReconfiguration {
+                    default_stream_config,
+                    stream_cipher,
+                    create_stream_on_append,
+                    create_stream_on_read,
                 },
             )
     }
@@ -839,6 +901,7 @@ mod tests {
         #[test]
         fn reconfigure_basin_unspecified_preserves(
             base_sc in proptest::option::of(gen_storage_class()),
+            base_algorithm in proptest::option::of(gen_encryption_algorithm()),
             base_on_append in any::<bool>(),
             base_on_read in any::<bool>(),
         ) {
@@ -847,6 +910,7 @@ mod tests {
                     storage_class: base_sc.map(Into::into),
                     ..Default::default()
                 },
+                stream_cipher: base_algorithm.map(Into::into),
                 create_stream_on_append: base_on_append,
                 create_stream_on_read: base_on_read,
             };
@@ -855,6 +919,7 @@ mod tests {
             let result = base.clone().reconfigure(reconfig);
 
             prop_assert_eq!(result.default_stream_config.storage_class, base.default_stream_config.storage_class);
+            prop_assert_eq!(result.stream_cipher, base.stream_cipher);
             prop_assert_eq!(result.create_stream_on_append, base.create_stream_on_append);
             prop_assert_eq!(result.create_stream_on_read, base.create_stream_on_read);
         }
@@ -864,6 +929,7 @@ mod tests {
             base_on_append in any::<bool>(),
             new_on_append in any::<bool>(),
             new_sc in gen_storage_class(),
+            new_algorithm in gen_encryption_algorithm(),
         ) {
             let base = types::config::BasinConfig {
                 create_stream_on_append: base_on_append,
@@ -875,12 +941,14 @@ mod tests {
                     storage_class: Maybe::Specified(Some(new_sc.into())),
                     ..Default::default()
                 })),
+                stream_cipher: Maybe::Specified(Some(new_algorithm.into())),
                 create_stream_on_append: Maybe::Specified(new_on_append),
                 ..Default::default()
             };
             let result = base.reconfigure(reconfig);
 
             prop_assert_eq!(result.default_stream_config.storage_class, Some(new_sc.into()));
+            prop_assert_eq!(result.stream_cipher, Some(new_algorithm.into()));
             prop_assert_eq!(result.create_stream_on_append, new_on_append);
         }
 

@@ -154,7 +154,11 @@ pub async fn check_tail(
         Operation::CheckTail,
     )?;
 
-    let tail = backend.check_tail(basin, stream).await?;
+    let tail = backend
+        .open_for_check_tail(&basin, &stream)
+        .await?
+        .check_tail()
+        .await?;
     Ok(Json(v1t::stream::TailResponse { tail: tail.into() }))
 }
 
@@ -192,6 +196,7 @@ pub struct ReadArgs {
     params(
         v1t::StreamNamePathSegment,
         s2_api::data::S2FormatHeader,
+        s2_api::data::S2EncryptionKeyHeader,
         v1t::stream::ReadStart,
         v1t::stream::ReadEnd,
     ),
@@ -226,11 +231,16 @@ pub async fn read(
     let start: ReadStart = start.try_into()?;
     match request {
         v1t::stream::ReadRequest::Unary {
+            encryption_key,
             format,
             response_mime,
         } => {
             let (start, end) = prepare_read(start, end, ReadMode::Unary)?;
-            let session = backend.read(basin, stream, start, end).await?;
+            let session = backend
+                .open_for_read(&basin, &stream, encryption_key)
+                .await?
+                .read(start, end)
+                .await?;
             let batch = merge_read_session(session, end.wait).await?;
             match response_mime {
                 JsonOrProto::Json => Ok(Json(v1t::stream::json::serialize_read_batch(
@@ -244,12 +254,17 @@ pub async fn read(
             }
         }
         v1t::stream::ReadRequest::EventStream {
+            encryption_key,
             format,
             last_event_id,
         } => {
             let (start, end) = apply_last_event_id(start, end, last_event_id);
             let (start, end) = prepare_read(start, end, ReadMode::Streaming)?;
-            let session = backend.read(basin, stream, start, end).await?;
+            let session = backend
+                .open_for_read(&basin, &stream, encryption_key)
+                .await?
+                .read(start, end)
+                .await?;
             let events = async_stream::stream! {
                 let mut processed = CountOrBytes::ZERO;
                 tokio::pin!(session);
@@ -266,7 +281,7 @@ pub async fn read(
                             processed.count += batch.records.len();
                             processed.bytes += batch.records.metered_size();
                             let id = v1t::stream::sse::LastEventId {
-                                seq_num: last_record.position.seq_num,
+                                seq_num: last_record.position().seq_num,
                                 count: processed.count,
                                 bytes: processed.bytes,
                             };
@@ -287,26 +302,25 @@ pub async fn read(
             Ok(axum::response::Sse::new(events).into_response())
         }
         v1t::stream::ReadRequest::S2s {
+            encryption_key,
             response_compression,
         } => {
             let (start, end) = prepare_read(start, end, ReadMode::Streaming)?;
-            let s2s_stream =
-                backend
-                    .read(basin, stream, start, end)
-                    .await?
-                    .map_ok(|msg| match msg {
-                        ReadSessionOutput::Heartbeat(tail) => v1t::stream::proto::ReadBatch {
-                            records: vec![],
-                            tail: Some(tail.into()),
-                        },
-                        ReadSessionOutput::Batch(batch) => {
-                            v1t::stream::proto::ReadBatch::from(batch)
-                        }
-                    });
-            let response_stream = s2s::FramedMessageStream::<_>::new(
-                response_compression,
-                Box::pin(s2s_stream.map_err(ServiceError::from)),
-            );
+            let s2s_stream = backend
+                .open_for_read(&basin, &stream, encryption_key)
+                .await?
+                .read(start, end)
+                .await?
+                .map_ok(|msg| match msg {
+                    ReadSessionOutput::Heartbeat(tail) => v1t::stream::proto::ReadBatch {
+                        records: vec![],
+                        tail: Some(tail.into()),
+                    },
+                    ReadSessionOutput::Batch(batch) => v1t::stream::proto::ReadBatch::from(batch),
+                })
+                .map_err(ServiceError::from);
+            let response_stream =
+                s2s::FramedMessageStream::<_>::new(response_compression, Box::pin(s2s_stream));
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(http::header::CONTENT_TYPE, "s2s/proto")
@@ -319,7 +333,7 @@ pub async fn read(
 async fn merge_read_session(
     session: impl Stream<Item = Result<ReadSessionOutput, ReadError>>,
     wait: Option<Duration>,
-) -> Result<ReadBatch, ReadError> {
+) -> Result<ReadBatch, ServiceError> {
     let mut acc = ReadBatch {
         records: Metered::with_capacity(RECORD_BATCH_MAX.count),
         tail: None,
@@ -382,7 +396,11 @@ pub struct AppendArgs {
         (status = StatusCode::NOT_FOUND, body = v1t::error::ErrorInfo),
         (status = StatusCode::REQUEST_TIMEOUT, body = v1t::error::ErrorInfo),
     ),
-    params(v1t::StreamNamePathSegment, s2_api::data::S2FormatHeader),
+    params(
+        v1t::StreamNamePathSegment,
+        s2_api::data::S2FormatHeader,
+        s2_api::data::S2EncryptionKeyHeader,
+    ),
     servers(
         (url = super::paths::cloud_endpoints::BASIN, variables(
             ("basin" = (
@@ -411,10 +429,14 @@ pub async fn append(
 
     match request {
         v1t::stream::AppendRequest::Unary {
+            encryption_key,
             input,
             response_mime,
         } => {
-            let ack = backend.append(basin, stream, input).await?;
+            let handle = backend
+                .open_for_append(&basin, &stream, encryption_key)
+                .await?;
+            let ack = handle.append(input).await?;
             match response_mime {
                 JsonOrProto::Json => {
                     let ack: v1t::stream::AppendAck = ack.into();
@@ -427,9 +449,13 @@ pub async fn append(
             }
         }
         v1t::stream::AppendRequest::S2s {
+            encryption_key,
             inputs,
             response_compression,
         } => {
+            let handle = backend
+                .open_for_append(&basin, &stream, encryption_key)
+                .await?;
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
             let inputs = async_stream::stream! {
@@ -448,13 +474,10 @@ pub async fn append(
                 }
             };
 
-            let ack_stream = backend
-                .append_session(basin, stream, inputs)
-                .await?
-                .map(|res| {
-                    res.map(v1t::stream::proto::AppendAck::from)
-                        .map_err(ServiceError::from)
-                });
+            let ack_stream = handle.append_session(inputs).map(|res| {
+                res.map(v1t::stream::proto::AppendAck::from)
+                    .map_err(ServiceError::from)
+            });
 
             let input_err_stream = futures::stream::once(err_rx).filter_map(|res| async move {
                 match res {
@@ -474,5 +497,445 @@ pub async fn append(
                 .body(Body::from_stream(response_stream))
                 .expect("valid response builder"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use axum::{
+        body::{self, Body},
+        http::{Request, StatusCode, header},
+        response::Response,
+    };
+    use bytes::{Bytes, BytesMut};
+    use bytesize::ByteSize;
+    use futures::TryStreamExt as _;
+    use prost::Message as _;
+    use s2_api::v1::stream::{
+        proto,
+        s2s::{FrameDecoder, SessionMessage},
+    };
+    use s2_common::{
+        encryption::{EncryptionAlgorithm, EncryptionKey, S2_ENCRYPTION_KEY_HEADER},
+        read_extent::{ReadLimit, ReadUntil},
+        record::{EnvelopeRecord, Metered, Record},
+        types::{
+            basin::{BASIN_HEADER, BasinName},
+            config::{BasinConfig, OptionalStreamConfig},
+            resources::CreateMode,
+            stream::{
+                AppendInput, AppendRecord, AppendRecordBatch, AppendRecordParts,
+                ListStreamsRequest, ReadEnd, ReadFrom, ReadSessionOutput, ReadStart, StreamName,
+            },
+        },
+    };
+    use slatedb::{Db, config::Settings, object_store::memory::InMemory};
+    use tokio_util::codec::Decoder as _;
+    use tower::ServiceExt as _;
+    use uuid::Uuid;
+
+    use crate::{
+        auth::AuthState,
+        backend::Backend,
+        handlers::{self, v1::AppState},
+    };
+
+    fn basin_config_with_stream_cipher(stream_cipher: EncryptionAlgorithm) -> BasinConfig {
+        BasinConfig {
+            default_stream_config: OptionalStreamConfig::default(),
+            stream_cipher: Some(stream_cipher),
+            ..Default::default()
+        }
+    }
+
+    fn aegis_key(byte: u8) -> EncryptionKey {
+        EncryptionKey::new([byte; 32])
+    }
+
+    async fn create_backend() -> Backend {
+        let object_store = Arc::new(InMemory::new());
+        let db_path = format!("/tmp/records-handler-test-{}", Uuid::new_v4());
+        let db = Db::builder(db_path, object_store)
+            .with_settings(Settings {
+                flush_interval: Some(Duration::from_millis(5)),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .expect("create in-memory db");
+        Backend::new(db, ByteSize::mib(10))
+    }
+
+    async fn setup_app_with_config(
+        test_suffix: &str,
+        basin_config: BasinConfig,
+        stream_config: OptionalStreamConfig,
+    ) -> (axum::Router, Backend, BasinName, StreamName) {
+        let backend = create_backend().await;
+        let basin: BasinName = format!("test-basin-{test_suffix}").parse().unwrap();
+        backend
+            .create_basin(basin.clone(), basin_config, CreateMode::CreateOnly(None))
+            .await
+            .expect("create basin");
+        let stream: StreamName = format!("test-stream-{test_suffix}").parse().unwrap();
+        backend
+            .create_stream(
+                basin.clone(),
+                stream.clone(),
+                stream_config,
+                CreateMode::CreateOnly(None),
+            )
+            .await
+            .expect("create stream");
+        let app_state = AppState {
+            backend: backend.clone(),
+            auth: AuthState::disabled(),
+        };
+        let app = handlers::router(&app_state).with_state(app_state);
+        (app, backend, basin, stream)
+    }
+
+    async fn setup_app_without_stream(
+        test_suffix: &str,
+        basin_config: BasinConfig,
+    ) -> (axum::Router, Backend, BasinName, StreamName) {
+        let backend = create_backend().await;
+        let basin: BasinName = format!("test-basin-{test_suffix}").parse().unwrap();
+        backend
+            .create_basin(basin.clone(), basin_config, CreateMode::CreateOnly(None))
+            .await
+            .expect("create basin");
+        let stream: StreamName = format!("test-stream-{test_suffix}").parse().unwrap();
+        let app_state = AppState {
+            backend: backend.clone(),
+            auth: AuthState::disabled(),
+        };
+        let app = handlers::router(&app_state).with_state(app_state);
+        (app, backend, basin, stream)
+    }
+
+    fn append_input(body: &'static [u8]) -> AppendInput {
+        let record = Metered::from(Record::Envelope(
+            EnvelopeRecord::try_from_parts(vec![], Bytes::from_static(body)).unwrap(),
+        ));
+        let record = AppendRecord::try_from(AppendRecordParts {
+            timestamp: None,
+            record,
+        })
+        .unwrap();
+        let records = AppendRecordBatch::try_from(vec![record]).unwrap();
+        AppendInput {
+            records,
+            match_seq_num: None,
+            fencing_token: None,
+        }
+    }
+
+    async fn append_encrypted_payload(
+        backend: &Backend,
+        basin: &BasinName,
+        stream: &StreamName,
+        body: &'static [u8],
+        encryption_key: EncryptionKey,
+    ) {
+        backend
+            .open_for_append(basin, stream, Some(encryption_key))
+            .await
+            .expect("open append handle")
+            .append(append_input(body))
+            .await
+            .expect("append encrypted payload");
+    }
+
+    fn read_uri(stream: &StreamName) -> String {
+        format!("/v1/streams/{stream}/records?seq_num=0&wait=0")
+    }
+
+    fn request_builder(
+        method: &str,
+        uri: impl Into<String>,
+        basin: &BasinName,
+    ) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri.into())
+            .header(BASIN_HEADER.as_str(), basin.as_ref())
+    }
+
+    async fn send(app: &axum::Router, request: Request<Body>) -> Response {
+        app.clone()
+            .oneshot(request)
+            .await
+            .expect("request should complete")
+    }
+
+    async fn response_bytes(response: Response, context: &str) -> Bytes {
+        body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect(context)
+    }
+
+    async fn response_json(response: Response, context: &str) -> serde_json::Value {
+        let body = response_bytes(response, context).await;
+        serde_json::from_slice(&body).expect("json body")
+    }
+
+    fn decode_single_frame(body: Bytes, context: &str) -> SessionMessage {
+        let mut decoder = FrameDecoder;
+        let mut buf = BytesMut::from(body.as_ref());
+        let frame = decoder
+            .decode(&mut buf)
+            .expect("frame decode")
+            .expect(context);
+        assert!(buf.is_empty(), "expected a single frame");
+        frame
+    }
+
+    fn assert_invalid_error(info: &serde_json::Value, expected_message: &str) {
+        assert_eq!(info["code"], "invalid");
+        assert!(
+            info["message"]
+                .as_str()
+                .expect("error message string")
+                .contains(expected_message)
+        );
+    }
+
+    async fn assert_no_streams(backend: &Backend, basin: &BasinName) {
+        let stream_list = backend
+            .list_streams(basin.clone(), ListStreamsRequest::default())
+            .await
+            .expect("list streams");
+        assert!(stream_list.values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unary_append_with_encryption_header_persists_encrypted_record() {
+        let encryption_key = aegis_key(0x42);
+        let (app, backend, basin, stream) = setup_app_with_config(
+            "append-unary-encrypted",
+            basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+            OptionalStreamConfig::default(),
+        )
+        .await;
+
+        let input = proto::AppendInput {
+            records: vec![proto::AppendRecord {
+                timestamp: None,
+                headers: vec![],
+                body: Bytes::from_static(b"secret"),
+            }],
+            match_seq_num: None,
+            fencing_token: None,
+        };
+
+        let response = send(
+            &app,
+            request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
+                .header(header::CONTENT_TYPE, "application/protobuf")
+                .header(header::ACCEPT, "application/protobuf")
+                .header(
+                    S2_ENCRYPTION_KEY_HEADER.as_str(),
+                    encryption_key.to_header_value(),
+                )
+                .body(Body::from(input.encode_to_vec()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_bytes(response, "append ack body").await;
+        let ack = proto::AppendAck::decode(body).expect("append ack");
+        assert_eq!(ack.end.as_ref().map(|pos| pos.seq_num), Some(1));
+
+        let records = backend
+            .open_for_read(&basin, &stream, Some(encryption_key.clone()))
+            .await
+            .expect("open read handle")
+            .read(
+                ReadStart {
+                    from: ReadFrom::SeqNum(0),
+                    clamp: false,
+                },
+                ReadEnd {
+                    limit: ReadLimit::Unbounded,
+                    until: ReadUntil::Unbounded,
+                    wait: Some(Duration::ZERO),
+                },
+            )
+            .await
+            .expect("create read session")
+            .try_filter_map(|output| async move {
+                match output {
+                    ReadSessionOutput::Batch(batch) => Ok(Some(batch)),
+                    ReadSessionOutput::Heartbeat(_) => Ok(None),
+                }
+            })
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read encrypted record");
+        let batch = records.into_iter().next().expect("batch");
+        assert_eq!(batch.records.len(), 1);
+        let record = batch.records.first().expect("record");
+        let Record::Envelope(record) = record.inner() else {
+            panic!("expected envelope record");
+        };
+        assert_eq!(record.body().as_ref(), b"secret");
+    }
+
+    #[tokio::test]
+    async fn invalid_read_bounds_do_not_auto_create_stream() {
+        let basin_config = BasinConfig {
+            create_stream_on_read: true,
+            ..Default::default()
+        };
+        let (app, backend, basin, stream) =
+            setup_app_without_stream("read-invalid-bounds-no-create", basin_config).await;
+
+        let response = send(
+            &app,
+            request_builder(
+                "GET",
+                format!("/v1/streams/{stream}/records?timestamp=5&until=5"),
+                &basin,
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let info = response_json(response, "read error body").await;
+        assert_invalid_error(&info, "start `timestamp` exceeds or equal to `until`");
+        assert_no_streams(&backend, &basin).await;
+    }
+
+    #[tokio::test]
+    async fn unary_read_with_wrong_key_returns_decryption_failed_error() {
+        let encryption_key = aegis_key(0x42);
+        let wrong_key = aegis_key(0x24);
+        let (app, backend, basin, stream) = setup_app_with_config(
+            "read-unary-bad-key",
+            basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+            OptionalStreamConfig::default(),
+        )
+        .await;
+        append_encrypted_payload(&backend, &basin, &stream, b"secret", encryption_key).await;
+
+        let response = send(
+            &app,
+            request_builder("GET", read_uri(&stream), &basin)
+                .header(
+                    S2_ENCRYPTION_KEY_HEADER.as_str(),
+                    wrong_key.to_header_value(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let info = response_json(response, "read error body").await;
+        assert_eq!(info["code"], "decryption_failed");
+        assert!(
+            info["message"]
+                .as_str()
+                .expect("error message string")
+                .contains("record decryption failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_read_without_key_header_is_rejected_before_stream_starts() {
+        let encryption_key = aegis_key(0x42);
+        let (app, backend, basin, stream) = setup_app_with_config(
+            "read-sse-plain",
+            basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+            OptionalStreamConfig::default(),
+        )
+        .await;
+        append_encrypted_payload(&backend, &basin, &stream, b"secret", encryption_key).await;
+
+        let response = send(
+            &app,
+            request_builder(
+                "GET",
+                format!("/v1/streams/{stream}/records?seq_num=0"),
+                &basin,
+            )
+            .header(header::ACCEPT, "text/event-stream")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let info = response_json(response, "sse read error body").await;
+        assert_invalid_error(&info, "missing encryption key");
+    }
+
+    #[tokio::test]
+    async fn s2s_read_without_key_header_is_rejected_before_stream_starts() {
+        let encryption_key = aegis_key(0x42);
+        let (app, backend, basin, stream) = setup_app_with_config(
+            "read-s2s-plain",
+            basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+            OptionalStreamConfig::default(),
+        )
+        .await;
+        append_encrypted_payload(&backend, &basin, &stream, b"secret", encryption_key).await;
+
+        let response = send(
+            &app,
+            request_builder("GET", read_uri(&stream), &basin)
+                .header(header::CONTENT_TYPE, "s2s/proto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let info = response_json(response, "s2s read error body").await;
+        assert_invalid_error(&info, "missing encryption key");
+    }
+
+    #[tokio::test]
+    async fn s2s_read_with_correct_encryption_returns_batch_frame() {
+        let encryption_key = aegis_key(0x42);
+        let (app, backend, basin, stream) = setup_app_with_config(
+            "read-s2s-ok",
+            basin_config_with_stream_cipher(EncryptionAlgorithm::Aegis256),
+            OptionalStreamConfig::default(),
+        )
+        .await;
+        append_encrypted_payload(&backend, &basin, &stream, b"secret", encryption_key.clone())
+            .await;
+
+        let response = send(
+            &app,
+            request_builder("GET", read_uri(&stream), &basin)
+                .header(header::CONTENT_TYPE, "s2s/proto")
+                .header(
+                    S2_ENCRYPTION_KEY_HEADER.as_str(),
+                    encryption_key.to_header_value(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_bytes(response, "s2s body").await;
+        let frame = decode_single_frame(body, "batch frame");
+        let SessionMessage::Regular(batch) = frame else {
+            panic!("expected regular frame");
+        };
+        let batch = batch
+            .try_into_proto::<proto::ReadBatch>()
+            .expect("decode read batch proto");
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].body.as_ref(), b"secret");
     }
 }

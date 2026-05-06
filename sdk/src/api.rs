@@ -9,14 +9,14 @@ use http::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, InvalidHeaderValue},
 };
 use prost::{self, Message};
+#[cfg(feature = "_hidden")]
+use s2_api::v1::basin::CreateOrReconfigureBasinRequest;
 use s2_api::v1::{
     access::{
         AccessTokenInfo, IssueAccessTokenResponse, ListAccessTokensRequest,
         ListAccessTokensResponse,
     },
-    basin::{
-        BasinInfo, CreateBasinRequest, ListBasinsRequest, ListBasinsResponse,
-    },
+    basin::{BasinInfo, CreateBasinRequest, ListBasinsRequest, ListBasinsResponse},
     config::{BasinConfig, BasinReconfiguration, StreamConfig, StreamReconfiguration},
     metrics::{
         AccountMetricSetRequest, BasinMetricSetRequest, MetricSetResponse, StreamMetricSetRequest,
@@ -28,21 +28,19 @@ use s2_api::v1::{
         s2s::{self, FrameDecoder, SessionMessage, TerminalMessage},
     },
 };
+use s2_common::encryption::S2_ENCRYPTION_KEY_HEADER;
 use secrecy::ExposeSecret;
 use tokio_util::codec::Decoder;
 use tracing::{debug, warn};
 use url::Url;
-#[cfg(feature = "_hidden")]
-use s2_api::v1::basin::CreateOrReconfigureBasinRequest;
-
-use crate::frame_signal::FrameSignal;
 
 use crate::{
     client::{self, StreamingResponse, UnaryResponse},
+    frame_signal::FrameSignal,
     retry::{RetryBackoff, RetryBackoffBuilder},
     types::{
-        AccessTokenId, AppendRetryPolicy, BasinAuthority, BasinName, Compression, RetryConfig,
-        S2Config, S2Endpoints, StreamName,
+        AccessTokenId, AppendRetryPolicy, BasinAuthority, BasinName, Compression, EncryptionKey,
+        RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
 
@@ -348,17 +346,19 @@ impl BasinClient {
         &self,
         name: &StreamName,
         input: AppendInput,
+        encryption: Option<&EncryptionKey>,
         append_retry_policy: AppendRetryPolicy,
     ) -> Result<AppendAck, ApiError> {
         let url = self
             .base_url
             .join(&format!("v1/streams/{}/records", urlencoding::encode(name)))?;
-        let request = self
+        let mut request = self
             .post(url)
             .header(CONTENT_TYPE, CONTENT_TYPE_PROTO)
             .header(ACCEPT, ACCEPT_PROTO)
             .body(input.encode_to_vec())
             .build()?;
+        set_encryption_header(&mut request, encryption);
         let response = self
             .request(request)
             .with_append_retry_policy(append_retry_policy)
@@ -384,6 +384,7 @@ impl BasinClient {
         name: &StreamName,
         start: ReadStart,
         end: ReadEnd,
+        encryption: Option<&EncryptionKey>,
     ) -> Result<ReadBatch, ApiError> {
         let url = self
             .base_url
@@ -394,9 +395,11 @@ impl BasinClient {
             .query(&start)
             .query(&end);
         if let Some(wait) = end.wait {
-            builder = builder.timeout(self.client.request_timeout + Duration::from_secs(wait.into()));
+            builder =
+                builder.timeout(self.client.request_timeout + Duration::from_secs(wait.into()));
         }
-        let request = builder.build()?;
+        let mut request = builder.build()?;
+        set_encryption_header(&mut request, encryption);
         let response = self
             .request(request)
             .error_handler(read_response_error_handler)
@@ -409,6 +412,7 @@ impl BasinClient {
         &self,
         name: &StreamName,
         inputs: I,
+        encryption: Option<&EncryptionKey>,
         frame_signal: Option<FrameSignal>,
     ) -> Result<Streaming<AppendAck>, ApiError>
     where
@@ -438,9 +442,11 @@ impl BasinClient {
             .timeout(self.client.request_timeout);
         request_builder =
             add_basin_header_if_required(request_builder, &self.config.endpoints, &self.name);
+        let mut request = request_builder.build()?;
+        set_encryption_header(&mut request, encryption);
         let response = self
             .client
-            .init_streaming(request_builder.build()?)
+            .init_streaming(request)
             .await?
             .into_result()
             .await?;
@@ -467,6 +473,11 @@ impl BasinClient {
                     }
                 }
             }
+            if !buffer.is_empty() {
+                Err(ClientError::UnexpectedEof(
+                    format!("not all bytes were consumed from the buffer, {} remaining", buffer.len()),
+                ))?;
+            }
         }))
     }
 
@@ -475,6 +486,7 @@ impl BasinClient {
         name: &StreamName,
         start: ReadStart,
         end: ReadEnd,
+        encryption: Option<&EncryptionKey>,
     ) -> Result<Streaming<ReadBatch>, ApiError> {
         let url = self
             .base_url
@@ -489,9 +501,11 @@ impl BasinClient {
             .timeout(self.client.request_timeout);
         request_builder =
             add_basin_header_if_required(request_builder, &self.config.endpoints, &self.name);
+        let mut request = request_builder.build()?;
+        set_encryption_header(&mut request, encryption);
         let response = self
             .client
-            .init_streaming(request_builder.build()?)
+            .init_streaming(request)
             .await?
             .into_result()
             .await?;
@@ -517,6 +531,11 @@ impl BasinClient {
                         Err(err) => Err(err)?,
                     }
                 }
+            }
+            if !buffer.is_empty() {
+                Err(ClientError::UnexpectedEof(
+                    format!("not all bytes were consumed from the buffer, {} remaining", buffer.len()),
+                ))?;
             }
         }))
     }
@@ -900,6 +919,15 @@ impl BaseClient {
     }
 }
 
+fn set_encryption_header(request: &mut client::Request, encryption: Option<&EncryptionKey>) {
+    if let Some(encryption) = encryption {
+        request.headers_mut().insert(
+            S2_ENCRYPTION_KEY_HEADER.clone(),
+            encryption.to_header_value(),
+        );
+    }
+}
+
 pub fn retry_builder(config: &RetryConfig) -> RetryBackoffBuilder {
     RetryBackoffBuilder::default()
         .with_min_base_delay(config.min_base_delay)
@@ -963,10 +991,7 @@ impl<'a> RequestBuilder<'a> {
                 r
             };
 
-            let response = self
-                .client
-                .execute_unary(attempt_request)
-                .await;
+            let response = self.client.execute_unary(attempt_request).await;
 
             let (err, retry_after) = match response {
                 Ok(resp) => {
@@ -1183,7 +1208,9 @@ mod tests {
         // Server errors that do NOT guarantee no mutation.
         assert!(!server_error(StatusCode::INTERNAL_SERVER_ERROR, "internal").has_no_side_effects());
         assert!(!server_error(StatusCode::BAD_GATEWAY, "other").has_no_side_effects());
-        assert!(!server_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable").has_no_side_effects());
+        assert!(
+            !server_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable").has_no_side_effects()
+        );
     }
 
     #[test]
@@ -1247,6 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn dns_error_message_is_clear() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let config = crate::types::S2Config::new("test-token".to_owned())
             .with_endpoints(
                 crate::types::S2Endpoints::new(

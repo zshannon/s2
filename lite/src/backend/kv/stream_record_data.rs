@@ -1,15 +1,14 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use enum_ordinalize::Ordinalize;
-use s2_common::record::{Encodable, Metered, Record, StreamPosition};
+use s2_common::record::{Encodable, Metered, StoredRecord, StreamPosition};
 
 use super::{DeserializationError, KeyType, check_exact_size, invalid_value_err};
-use crate::backend::stream_id::StreamId;
+use crate::stream_id::StreamId;
 
 const KEY_LEN: usize = 1 + StreamId::LEN + 8 + 8;
 
 pub fn ser_key(stream_id: StreamId, pos: StreamPosition) -> Bytes {
     let mut buf = BytesMut::with_capacity(KEY_LEN);
-    buf.put_u8(KeyType::StreamRecordData.ordinal());
+    buf.put_u8(KeyType::StreamRecordData as u8);
     buf.put_slice(stream_id.as_bytes());
     buf.put_u64(pos.seq_num);
     buf.put_u64(pos.timestamp);
@@ -20,7 +19,7 @@ pub fn ser_key(stream_id: StreamId, pos: StreamPosition) -> Bytes {
 pub fn deser_key(mut bytes: Bytes) -> Result<(StreamId, StreamPosition), DeserializationError> {
     check_exact_size(&bytes, KEY_LEN)?;
     let ordinal = bytes.get_u8();
-    if ordinal != KeyType::StreamRecordData.ordinal() {
+    if ordinal != (KeyType::StreamRecordData as u8) {
         return Err(DeserializationError::InvalidOrdinal(ordinal));
     }
     let mut stream_id_bytes = [0u8; StreamId::LEN];
@@ -33,11 +32,11 @@ pub fn deser_key(mut bytes: Bytes) -> Result<(StreamId, StreamPosition), Deseria
     ))
 }
 
-pub fn ser_value(record: Metered<&Record>) -> Bytes {
+pub fn ser_value(record: Metered<&StoredRecord>) -> Bytes {
     record.to_bytes()
 }
 
-pub fn deser_value(bytes: Bytes) -> Result<Metered<Record>, DeserializationError> {
+pub fn deser_value(bytes: Bytes) -> Result<Metered<StoredRecord>, DeserializationError> {
     Metered::try_from(bytes).map_err(|e| invalid_value_err("record", e))
 }
 
@@ -45,9 +44,9 @@ pub fn deser_value(bytes: Bytes) -> Result<Metered<Record>, DeserializationError
 mod tests {
     use bytes::Bytes;
     use proptest::prelude::*;
-    use s2_common::record::{SeqNum, StreamPosition, Timestamp};
+    use s2_common::record::{Metered, SeqNum, StreamPosition, Timestamp};
 
-    use crate::backend::{kv::DeserializationError, stream_id::StreamId};
+    use crate::{backend::kv::DeserializationError, stream_id::StreamId};
 
     #[test]
     fn stream_record_data_rejects_invalid_payload() {
@@ -79,7 +78,7 @@ mod tests {
             header_value in prop::collection::vec(any::<u8>(), 0..50),
             body in prop::collection::vec(any::<u8>(), 0..200),
         ) {
-            use s2_common::record::{Header, MeteredSize, Record};
+            use s2_common::record::{Header, MeteredSize, Record, StoredRecord};
 
             let header_name = Bytes::from(header_name);
             let header_value = Bytes::from(header_value);
@@ -91,11 +90,14 @@ mod tests {
             let expected_headers = headers.clone();
             let expected_body = body.clone();
             let record = Record::try_from_parts(headers.clone(), body).unwrap();
-            let metered_record: s2_common::record::Metered<Record> = record.into();
+            let metered_record: Metered<Record> = record.into();
             let original_size = metered_record.metered_size();
 
-            let bytes = super::ser_value(metered_record.as_ref());
+            let bytes = super::ser_value(
+                Metered::from(StoredRecord::from(metered_record.into_inner())).as_ref()
+            );
             let decoded = super::deser_value(bytes).unwrap();
+            let decoded: Metered<Record> = super::ser_value(decoded.as_ref()).try_into().unwrap();
 
             prop_assert_eq!(original_size, decoded.metered_size());
             let (decoded_headers, decoded_body) = decoded.into_inner().into_parts();

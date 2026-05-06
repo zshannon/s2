@@ -1,18 +1,20 @@
 use std::ops::RangeTo;
 
-use enum_ordinalize::Ordinalize;
 use futures::{StreamExt, stream};
 use s2_common::{
     record::{NonZeroSeqNum, SeqNum, StreamPosition, Timestamp},
     types::resources::Page,
 };
 use slatedb::{
-    WriteBatch,
+    IterationOrder, WriteBatch,
     config::{DurabilityLevel, ScanOptions, WriteOptions},
 };
 use tracing::instrument;
 
-use crate::backend::{Backend, error::StorageError, kv, store::db_txn_get, stream_id::StreamId};
+use crate::{
+    backend::{Backend, error::StorageError, kv, store::db_txn_get},
+    stream_id::StreamId,
+};
 
 const PENDING_LIST_LIMIT: usize = 128;
 const CONCURRENCY: usize = 4;
@@ -45,6 +47,7 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self
             .db
@@ -94,13 +97,14 @@ impl Backend {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
+            order: IterationOrder::Ascending,
         };
         let mut it = self.db.scan_with_options(start_key.., &SCAN_OPTS).await?;
         let mut batch = WriteBatch::new();
         let mut batch_size = 0usize;
         let mut has_remaining_records = false;
         while let Some(kv) = it.next().await? {
-            if kv.key.first().copied() != Some(kv::KeyType::StreamRecordTimestamp.ordinal()) {
+            if kv.key.first().copied() != Some(kv::KeyType::StreamRecordTimestamp as u8) {
                 break;
             }
             let (deser_stream_id, pos) = kv::stream_record_timestamp::deser_key(kv.key.clone())?;
@@ -182,18 +186,20 @@ mod tests {
 
     use bytes::Bytes;
     use s2_common::{
-        record::{FencingToken, Metered, NonZeroSeqNum, Record, SeqNum, StreamPosition},
+        record::{
+            FencingToken, Metered, NonZeroSeqNum, Record, SeqNum, StoredRecord, StreamPosition,
+        },
         types::{basin::BasinName, config::OptionalStreamConfig, stream::StreamName},
     };
     use slatedb::{WriteBatch, config::WriteOptions};
     use time::OffsetDateTime;
 
     use super::super::tests::test_backend;
-    use crate::backend::{kv, stream_id::StreamId};
+    use crate::{backend::kv, stream_id::StreamId};
 
-    fn test_record() -> Metered<Record> {
+    fn test_record() -> Metered<StoredRecord> {
         let record = Record::try_from_parts(vec![], Bytes::from_static(b"trim-test")).unwrap();
-        record.into()
+        StoredRecord::from(record).into()
     }
 
     fn trim_point(seq_num: SeqNum) -> RangeTo<NonZeroSeqNum> {
@@ -282,6 +288,7 @@ mod tests {
 
         let meta = kv::stream_meta::StreamMeta {
             config: OptionalStreamConfig::default(),
+            cipher: None,
             created_at: OffsetDateTime::now_utc(),
             deleted_at: None,
             creation_idempotency_key: None,

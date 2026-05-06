@@ -50,6 +50,9 @@ pub struct StreamSpec {
 pub struct BasinConfigSpec {
     #[serde(default)]
     pub default_stream_config: Option<StreamConfigSpec>,
+    /// Encryption algorithm to apply to newly created streams in the basin.
+    #[serde(default)]
+    pub stream_cipher: Option<EncryptionAlgorithmSpec>,
     /// Create stream on append if it doesn't exist, using the default stream configuration.
     #[serde(default)]
     pub create_stream_on_append: Option<bool>,
@@ -102,6 +105,37 @@ impl From<StorageClassSpec> for StorageClass {
         match s {
             StorageClassSpec::Standard => StorageClass::Standard,
             StorageClassSpec::Express => StorageClass::Express,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum EncryptionAlgorithmSpec {
+    #[serde(rename = "aegis-256")]
+    Aegis256,
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+}
+
+impl schemars::JsonSchema for EncryptionAlgorithmSpec {
+    fn schema_name() -> Cow<'static, str> {
+        "EncryptionAlgorithmSpec".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "Encryption algorithm to apply to newly created streams in the basin.",
+            "enum": ["aegis-256", "aes-256-gcm"]
+        })
+    }
+}
+
+impl From<EncryptionAlgorithmSpec> for s2_common::encryption::EncryptionAlgorithm {
+    fn from(m: EncryptionAlgorithmSpec) -> Self {
+        match m {
+            EncryptionAlgorithmSpec::Aegis256 => Self::Aegis256,
+            EncryptionAlgorithmSpec::Aes256Gcm => Self::Aes256Gcm,
         }
     }
 }
@@ -245,6 +279,10 @@ impl From<BasinConfigSpec> for BasinReconfiguration {
             default_stream_config: s
                 .default_stream_config
                 .map(|dsc| Some(StreamReconfiguration::from(dsc)))
+                .map_or(Maybe::Unspecified, Maybe::Specified),
+            stream_cipher: s
+                .stream_cipher
+                .map(|algorithm| Some(algorithm.into()))
                 .map_or(Maybe::Unspecified, Maybe::Specified),
             create_stream_on_append: s
                 .create_stream_on_append
@@ -536,6 +574,7 @@ mod tests {
     fn basin_config_conversion() {
         let spec = BasinConfigSpec {
             default_stream_config: None,
+            stream_cipher: None,
             create_stream_on_append: Some(true),
             create_stream_on_read: None,
         };
