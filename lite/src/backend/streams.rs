@@ -15,7 +15,11 @@ use slatedb::{
 use time::OffsetDateTime;
 use tracing::instrument;
 
-use super::{Backend, store::db_txn_get, streamer::doe_arm_delay};
+use super::{
+    Backend,
+    store::db_txn_get,
+    streamer::{TerminalTrimCondition, TerminalTrimOutcome, doe_arm_delay},
+};
 use crate::{
     backend::{
         error::{
@@ -178,28 +182,20 @@ impl Backend {
             let meta = outcome.inner();
 
             txn.put(&stream_meta_key, kv::stream_meta::ser_value(meta))?;
+
             let stream_id = StreamId::new(&basin, &stream);
+
             if matches!(&outcome, ProvisionResult::Created(_)) {
                 txn.put(
                     kv::stream_id_mapping::ser_key(stream_id),
                     kv::stream_id_mapping::ser_value(&basin, &stream),
                 )?;
-                let created_secs = meta.created_at.unix_timestamp();
-                let created_secs = if created_secs <= 0 {
-                    0
-                } else if created_secs >= i64::from(u32::MAX) {
-                    u32::MAX
-                } else {
-                    created_secs as u32
-                };
                 txn.put(
                     kv::stream_tail_position::ser_key(stream_id),
-                    kv::stream_tail_position::ser_value(
-                        StreamPosition::MIN,
-                        kv::timestamp::TimestampSecs::from_secs(created_secs),
-                    ),
+                    kv::stream_tail_position::ser_value(StreamPosition::MIN),
                 )?;
             }
+
             if let Some(min_age) = meta.config.delete_on_empty.min_age()
                 && (matches!(&outcome, ProvisionResult::Created(_)) || prior_doe_min_age.is_none())
             {
@@ -337,19 +333,37 @@ impl Backend {
         basin: BasinName,
         stream: StreamName,
     ) -> Result<(), DeleteStreamError> {
-        match self.streamer_client_guarded(&basin, &stream).await {
-            Ok(client) => {
-                client.terminal_trim().await?;
-            }
+        self.delete_stream_with_condition(basin, stream, TerminalTrimCondition::Always)
+            .await
+    }
+
+    pub(super) async fn delete_stream_with_condition(
+        &self,
+        basin: BasinName,
+        stream: StreamName,
+        condition: TerminalTrimCondition,
+    ) -> Result<(), DeleteStreamError> {
+        let outcome = match self.streamer_client_guarded(&basin, &stream).await {
+            Ok(client) => client.terminal_trim(condition).await?,
             Err(StreamerError::Storage(e)) => {
                 return Err(DeleteStreamError::Storage(e));
             }
             Err(StreamerError::StreamNotFound(e)) => {
                 return Err(DeleteStreamError::StreamNotFound(e));
             }
-            Err(StreamerError::StreamDeletionPending(_)) => {}
+            Err(StreamerError::StreamDeletionPending(_)) => TerminalTrimOutcome::DeletionPending,
+        };
+        match outcome {
+            TerminalTrimOutcome::DeletionPending => self.mark_stream_deleted(basin, stream).await,
+            TerminalTrimOutcome::Ineligible => Ok(()),
         }
+    }
 
+    async fn mark_stream_deleted(
+        &self,
+        basin: BasinName,
+        stream: StreamName,
+    ) -> Result<(), DeleteStreamError> {
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         let meta_key = kv::stream_meta::ser_key(&basin, &stream);
         let mut meta = db_txn_get(&txn, &meta_key, kv::stream_meta::deser_value)
@@ -363,7 +377,6 @@ impl Backend {
             txn.put(&meta_key, kv::stream_meta::ser_value(&meta))?;
             txn.commit().await?;
         }
-
         Ok(())
     }
 }

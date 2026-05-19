@@ -65,7 +65,7 @@ impl Backend {
     ) -> Result<(), StorageError> {
         let has_remaining_records = self.delete_records(stream_id, trim_point).await?;
         if trim_point.end < NonZeroSeqNum::MAX && !has_remaining_records {
-            self.arm_doe_maybe(stream_id).await?;
+            self.arm_doe_on_full_trim(stream_id).await?;
         }
         self.finalize_trim(stream_id, trim_point).await?;
         Ok(())
@@ -283,13 +283,10 @@ mod tests {
             .db
             .put(
                 kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(
-                    StreamPosition {
-                        seq_num: 10,
-                        timestamp: 1234,
-                    },
-                    kv::timestamp::TimestampSecs::from_secs(10),
-                ),
+                kv::stream_tail_position::ser_value(StreamPosition {
+                    seq_num: 10,
+                    timestamp: 1234,
+                }),
             )
             .await
             .unwrap();

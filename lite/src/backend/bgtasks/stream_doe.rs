@@ -15,7 +15,7 @@ use crate::{
         Backend,
         error::{DeleteStreamError, StorageError, StreamDeleteOnEmptyError},
         kv::{self, timestamp::TimestampSecs},
-        streamer::doe_arm_delay,
+        streamer::{TerminalTrimCondition, doe_arm_delay},
     },
     stream_id::StreamId,
 };
@@ -23,10 +23,27 @@ use crate::{
 const PENDING_LIST_LIMIT: usize = 10_000;
 const CONCURRENCY: usize = 4;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingDoeEntry {
-    deadline: TimestampSecs,
-    min_age: Duration,
+#[derive(Debug)]
+struct PendingDoeBatch {
+    entries: Vec<kv::stream_doe_deadline::Entry>,
+    last_write_cutoff: Option<TimestampSecs>,
+}
+
+impl PendingDoeBatch {
+    fn new(entries: Vec<kv::stream_doe_deadline::Entry>) -> Self {
+        let last_write_cutoff = entries
+            .iter()
+            .filter_map(|entry| entry.last_write_cutoff())
+            .max();
+        Self {
+            entries,
+            last_write_cutoff,
+        }
+    }
+
+    fn entries(&self) -> &[kv::stream_doe_deadline::Entry] {
+        &self.entries
+    }
 }
 
 impl Backend {
@@ -51,7 +68,7 @@ impl Backend {
     async fn list_pending_stream_doe(
         &self,
         now: TimestampSecs,
-    ) -> Result<Page<(StreamId, Vec<PendingDoeEntry>)>, StorageError> {
+    ) -> Result<Page<(StreamId, PendingDoeBatch)>, StorageError> {
         let scan_opts = ScanOptions {
             durability_filter: DurabilityLevel::Remote,
             ..Default::default()
@@ -60,7 +77,7 @@ impl Backend {
             .db
             .scan_with_options(kv::stream_doe_deadline::expired_key_range(now), &scan_opts)
             .await?;
-        let mut pending: IndexMap<StreamId, Vec<PendingDoeEntry>> = IndexMap::new();
+        let mut pending: IndexMap<StreamId, Vec<kv::stream_doe_deadline::Entry>> = IndexMap::new();
         let mut has_more = false;
         let mut count = 0;
         while let Some(kv) = it.next().await? {
@@ -70,64 +87,52 @@ impl Backend {
             pending
                 .entry(stream_id)
                 .or_default()
-                .push(PendingDoeEntry { deadline, min_age });
+                .push(kv::stream_doe_deadline::Entry { deadline, min_age });
             count += 1;
             if count == PENDING_LIST_LIMIT {
                 has_more = true;
                 break;
             }
         }
-        Ok(Page::new(pending.into_iter().collect_vec(), has_more))
+        Ok(Page::new(
+            pending
+                .into_iter()
+                .map(|(stream_id, entries)| (stream_id, PendingDoeBatch::new(entries)))
+                .collect_vec(),
+            has_more,
+        ))
     }
 
     async fn process_stream_doe(
         &self,
         stream_id: StreamId,
-        pending: Vec<PendingDoeEntry>,
+        pending: PendingDoeBatch,
     ) -> Result<(), StreamDeleteOnEmptyError> {
-        let should_delete = if self.stream_has_records(stream_id).await? {
-            false
-        } else {
-            self.stream_doe_is_eligible(stream_id, &pending).await?
-        };
-        if should_delete && let Some((basin, stream)) = self.stream_id_mapping(stream_id).await? {
-            match self.delete_stream(basin, stream).await {
+        if let Some(last_write_cutoff) = pending.last_write_cutoff
+            && let Some((basin, stream)) = self.stream_id_mapping(stream_id).await?
+        {
+            match self
+                .delete_stream_with_condition(
+                    basin,
+                    stream,
+                    TerminalTrimCondition::DeleteOnEmpty { last_write_cutoff },
+                )
+                .await
+            {
                 Ok(()) | Err(DeleteStreamError::StreamNotFound(_)) => {}
                 Err(err) => return Err(err.into()),
             }
         }
-        self.clear_doe_deadlines(stream_id, &pending).await?;
+        self.clear_doe_deadlines(stream_id, pending.entries())
+            .await?;
         Ok(())
-    }
-
-    async fn stream_doe_is_eligible(
-        &self,
-        stream_id: StreamId,
-        pending: &[PendingDoeEntry],
-    ) -> Result<bool, StorageError> {
-        let Some((_, write_timestamp)) = self
-            .db_get(
-                kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::deser_value,
-            )
-            .await?
-        else {
-            return Ok(false);
-        };
-        let write_timestamp = u64::from(write_timestamp.as_u32());
-        Ok(pending.iter().any(|entry| {
-            let deadline_secs = u64::from(entry.deadline.as_u32());
-            write_timestamp
-                .checked_add(entry.min_age.as_secs())
-                .is_some_and(|sum| sum <= deadline_secs)
-        }))
     }
 
     #[instrument(ret, err, skip(self, pending), fields(num_deadlines = pending.len()))]
     async fn clear_doe_deadlines(
         &self,
         stream_id: StreamId,
-        pending: &[PendingDoeEntry],
+        pending: &[kv::stream_doe_deadline::Entry],
     ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
         for entry in pending {
@@ -137,14 +142,10 @@ impl Backend {
         Ok(())
     }
 
-    #[instrument(ret, err, skip(self))]
-    async fn stream_has_records(&self, stream_id: StreamId) -> Result<bool, StorageError> {
-        let prefix = kv::stream_record_timestamp::ser_key_prefix(stream_id);
-        let mut it = self.db.scan_prefix(prefix).await?;
-        Ok(it.next().await?.is_some())
-    }
-
-    pub(super) async fn arm_doe_maybe(&self, stream_id: StreamId) -> Result<(), StorageError> {
+    pub(super) async fn arm_doe_on_full_trim(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<(), StorageError> {
         let Some((basin, stream)) = self.stream_id_mapping(stream_id).await? else {
             return Ok(());
         };
@@ -163,10 +164,7 @@ impl Backend {
         let Some(min_age) = meta.config.delete_on_empty.min_age() else {
             return Ok(());
         };
-        let deadline = TimestampSecs::after(doe_arm_delay(
-            meta.config.retention_policy.age().unwrap_or_default(),
-            min_age,
-        ));
+        let deadline = TimestampSecs::after(doe_arm_delay(Duration::ZERO, min_age));
         self.db
             .put(
                 kv::stream_doe_deadline::ser_key(deadline, stream_id),
@@ -196,7 +194,7 @@ mod tests {
     use slatedb::config::{DurabilityLevel, ScanOptions};
     use time::OffsetDateTime;
 
-    use super::{super::tests::test_backend, TimestampSecs};
+    use super::{super::tests::test_backend, PendingDoeBatch, TimestampSecs};
     use crate::{
         backend::{Backend, kv},
         stream_id::StreamId,
@@ -286,41 +284,77 @@ mod tests {
         entries
     }
 
+    async fn put_tail_position(
+        backend: &Backend,
+        stream_id: StreamId,
+        position: StreamPosition,
+    ) -> TimestampSecs {
+        let key = kv::stream_tail_position::ser_key(stream_id);
+        backend
+            .db
+            .put(key.clone(), kv::stream_tail_position::ser_value(position))
+            .await
+            .unwrap();
+        let kv = backend
+            .db
+            .get_key_value(key)
+            .await
+            .unwrap()
+            .expect("tail position should exist");
+        TimestampSecs::from_millis(kv.create_ts)
+    }
+
+    fn deadline_after(write_timestamp: TimestampSecs, age: Duration) -> TimestampSecs {
+        let deadline_secs = u64::from(write_timestamp.as_u32())
+            .saturating_add(age.as_secs())
+            .min(u64::from(u32::MAX)) as u32;
+        TimestampSecs::from_secs(deadline_secs)
+    }
+
+    async fn process_pending_stream_doe_at(
+        backend: &Backend,
+        stream_id: StreamId,
+        now: TimestampSecs,
+    ) {
+        let mut page = backend.list_pending_stream_doe(now).await.unwrap();
+        assert!(!page.has_more);
+        assert_eq!(page.values.len(), 1);
+        let (pending_stream_id, pending) = page.values.pop().unwrap();
+        assert_eq!(pending_stream_id, stream_id);
+
+        backend
+            .process_stream_doe(stream_id, pending)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn stream_doe_marks_deleted_and_clears_deadline() {
         let backend = test_backend().await;
         let basin = BasinName::from_str("doe-basin").unwrap();
         let stream = StreamName::from_str("doe-stream").unwrap();
         let stream_id = seed_stream(&backend, &basin, &stream).await;
-        let deadline = TimestampSecs::from_secs(10_000);
-        let write_timestamp = TimestampSecs::from_secs(9_000);
-
-        backend
-            .db
-            .put(
-                kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(
-                    StreamPosition {
-                        seq_num: 1,
-                        timestamp: 1234,
-                    },
-                    write_timestamp,
-                ),
-            )
-            .await
-            .unwrap();
+        let write_timestamp = put_tail_position(
+            &backend,
+            stream_id,
+            StreamPosition {
+                seq_num: 1,
+                timestamp: 1234,
+            },
+        )
+        .await;
+        let deadline = write_timestamp;
 
         backend
             .db
             .put(
                 kv::stream_doe_deadline::ser_key(deadline, stream_id),
-                kv::stream_doe_deadline::ser_value(MIN_AGE),
+                kv::stream_doe_deadline::ser_value(Duration::ZERO),
             )
             .await
             .unwrap();
 
-        let has_more = backend.clone().tick_stream_doe().await.unwrap();
-        assert!(!has_more);
+        process_pending_stream_doe_at(&backend, stream_id, deadline).await;
 
         let meta = backend
             .db
@@ -345,37 +379,26 @@ mod tests {
         let basin = BasinName::from_str("doe-basin-never").unwrap();
         let stream = StreamName::from_str("doe-stream-never").unwrap();
         let stream_id = StreamId::new(&basin, &stream);
-        let created_at = OffsetDateTime::from_unix_timestamp(10).unwrap();
+        let created_at = OffsetDateTime::now_utc();
+        let min_age = Duration::ZERO;
         let mut config = OptionalStreamConfig::default();
-        config.delete_on_empty.min_age = Some(MIN_AGE);
+        config.delete_on_empty.min_age = Some(min_age);
         let meta = stream_meta_with_config(config, created_at);
 
         seed_stream_with_meta(&backend, &basin, &stream, meta).await;
 
-        let write_timestamp = TimestampSecs::from_secs(10);
-        backend
-            .db
-            .put(
-                kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(StreamPosition::MIN, write_timestamp),
-            )
-            .await
-            .unwrap();
-        let deadline_secs = u64::from(write_timestamp.as_u32())
-            .saturating_add(MIN_AGE.as_secs())
-            .min(u64::from(u32::MAX)) as u32;
-        let deadline = TimestampSecs::from_secs(deadline_secs);
+        let write_timestamp = put_tail_position(&backend, stream_id, StreamPosition::MIN).await;
+        let deadline = write_timestamp;
         backend
             .db
             .put(
                 kv::stream_doe_deadline::ser_key(deadline, stream_id),
-                kv::stream_doe_deadline::ser_value(MIN_AGE),
+                kv::stream_doe_deadline::ser_value(min_age),
             )
             .await
             .unwrap();
 
-        let has_more = backend.clone().tick_stream_doe().await.unwrap();
-        assert!(!has_more);
+        process_pending_stream_doe_at(&backend, stream_id, deadline).await;
 
         let meta = backend
             .db
@@ -400,23 +423,17 @@ mod tests {
         let basin = BasinName::from_str("doe-basin-recent").unwrap();
         let stream = StreamName::from_str("doe-stream-recent").unwrap();
         let stream_id = seed_stream(&backend, &basin, &stream).await;
-        let deadline = TimestampSecs::from_secs(10_000);
-        let write_timestamp = TimestampSecs::from_secs(10_000);
+        let write_timestamp = put_tail_position(
+            &backend,
+            stream_id,
+            StreamPosition {
+                seq_num: 1,
+                timestamp: 1234,
+            },
+        )
+        .await;
+        let deadline = write_timestamp;
 
-        backend
-            .db
-            .put(
-                kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(
-                    StreamPosition {
-                        seq_num: 1,
-                        timestamp: 1234,
-                    },
-                    write_timestamp,
-                ),
-            )
-            .await
-            .unwrap();
         backend
             .db
             .put(
@@ -426,8 +443,7 @@ mod tests {
             .await
             .unwrap();
 
-        let has_more = backend.clone().tick_stream_doe().await.unwrap();
-        assert!(!has_more);
+        process_pending_stream_doe_at(&backend, stream_id, deadline).await;
 
         let meta = backend
             .db
@@ -546,7 +562,7 @@ mod tests {
         let stream = StreamName::from_str("doe-stream-multi").unwrap();
         let stream_id = seed_stream(&backend, &basin, &stream).await;
         let far_future = TimestampSecs::after(Duration::from_secs(3600));
-        let deadline_a = TimestampSecs::after(Duration::from_secs(0));
+        let deadline_a = TimestampSecs::after(Duration::ZERO);
         let deadline_b = TimestampSecs::after(Duration::from_secs(1));
 
         backend
@@ -571,7 +587,11 @@ mod tests {
         assert_eq!(page.values.len(), 1);
         let (pending_stream_id, pending) = page.values.into_iter().next().unwrap();
         assert_eq!(pending_stream_id, stream_id);
-        let mut deadlines: Vec<_> = pending.iter().map(|entry| entry.deadline).collect();
+        let mut deadlines: Vec<_> = pending
+            .entries()
+            .iter()
+            .map(|entry| entry.deadline)
+            .collect();
         deadlines.sort();
         let mut expected = vec![deadline_a, deadline_b];
         expected.sort();
@@ -593,42 +613,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_doe_deletes_if_any_pending_entry_is_eligible() {
+    async fn stream_doe_uses_latest_eligible_cutoff_across_pending_entries() {
         let backend = test_backend().await;
         let basin = BasinName::from_str("doe-basin-pairs").unwrap();
         let stream = StreamName::from_str("doe-stream-pairs").unwrap();
         let stream_id = seed_stream(&backend, &basin, &stream).await;
 
+        let write_timestamp = put_tail_position(
+            &backend,
+            stream_id,
+            StreamPosition {
+                seq_num: 1,
+                timestamp: 1234,
+            },
+        )
+        .await;
+
         backend
-            .db
-            .put(
-                kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(
-                    StreamPosition {
-                        seq_num: 1,
-                        timestamp: 1234,
+            .process_stream_doe(
+                stream_id,
+                PendingDoeBatch::new(vec![
+                    kv::stream_doe_deadline::Entry {
+                        deadline: deadline_after(write_timestamp, Duration::from_secs(50)),
+                        min_age: Duration::from_secs(100),
                     },
-                    TimestampSecs::from_secs(1_050),
-                ),
+                    kv::stream_doe_deadline::Entry {
+                        deadline: deadline_after(write_timestamp, Duration::from_secs(100)),
+                        min_age: Duration::from_secs(10),
+                    },
+                ]),
             )
             .await
             .unwrap();
-
-        for (deadline, min_age) in [
-            (TimestampSecs::from_secs(1_100), Duration::from_secs(100)),
-            (TimestampSecs::from_secs(1_062), Duration::from_secs(10)),
-        ] {
-            backend
-                .db
-                .put(
-                    kv::stream_doe_deadline::ser_key(deadline, stream_id),
-                    kv::stream_doe_deadline::ser_value(min_age),
-                )
-                .await
-                .unwrap();
-        }
-
-        backend.clone().tick_stream_doe().await.unwrap();
 
         let meta = backend
             .db
@@ -664,7 +680,7 @@ mod tests {
             .db
             .put(
                 kv::stream_tail_position::ser_key(stream_id),
-                kv::stream_tail_position::ser_value(pos, TimestampSecs::now()),
+                kv::stream_tail_position::ser_value(pos),
             )
             .await
             .unwrap();
