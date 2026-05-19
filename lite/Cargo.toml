@@ -36,7 +36,6 @@ http = { workspace = true }
 humantime = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
-mimalloc = { workspace = true }
 parking_lot = { workspace = true, features = ["arc_lock"] }
 prometheus = { workspace = true, features = ["process"] }
 prost = { workspace = true }
@@ -58,6 +57,11 @@ tower-http = { workspace = true, features = ["cors", "trace", "sensitive-headers
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 utoipa = { workspace = true, optional = true, features = ["time"] }
+
+# tikv-jemallocator does not build on the MSVC toolchain; on Windows-MSVC
+# Rust falls back to the system allocator (HeapAlloc).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

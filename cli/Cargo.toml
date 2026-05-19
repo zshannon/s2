@@ -28,7 +28,6 @@ humantime = { workspace = true }
 indicatif = { workspace = true }
 json_to_table = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
-mimalloc = { workspace = true }
 rand = { workspace = true }
 ratatui = "0.30"
 rustls = { workspace = true, features = ["aws-lc-rs"] }
@@ -48,6 +47,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
+
+# tikv-jemallocator does not build on the MSVC toolchain; on Windows-MSVC
+# Rust falls back to the system allocator (HeapAlloc).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2.2"
