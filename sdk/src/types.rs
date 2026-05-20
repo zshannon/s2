@@ -8,6 +8,7 @@ use std::{
     ops::{Deref, RangeTo},
     pin::Pin,
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -403,6 +404,7 @@ pub struct S2Config {
     pub(crate) compression: Compression,
     pub(crate) user_agent: HeaderValue,
     pub(crate) insecure_skip_cert_verification: bool,
+    pub(crate) rustls_crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
 }
 
 impl S2Config {
@@ -419,6 +421,7 @@ impl S2Config {
                 .parse()
                 .expect("valid user agent"),
             insecure_skip_cert_verification: false,
+            rustls_crypto_provider: default_rustls_crypto_provider(),
         }
     }
 
@@ -482,6 +485,41 @@ impl S2Config {
         }
     }
 
+    /// Use a specific rustls crypto provider for SDK TLS connections.
+    ///
+    /// With default features enabled, the SDK uses the `aws-lc-rs` provider.
+    /// With default features disabled, the SDK uses rustls's process-global
+    /// provider if one has been installed, or returns an error otherwise.
+    ///
+    /// Use this when your application needs a specific rustls provider, such as
+    /// `ring` or a custom [`rustls::crypto::CryptoProvider`]. The corresponding
+    /// rustls provider feature must be enabled in the dependency graph.
+    pub fn with_rustls_crypto_provider(
+        self,
+        provider: impl Into<Arc<rustls::crypto::CryptoProvider>>,
+    ) -> Self {
+        Self {
+            rustls_crypto_provider: Some(provider.into()),
+            ..self
+        }
+    }
+
+    /// Use rustls's `aws-lc-rs` crypto provider.
+    ///
+    /// Requires the `rustls-aws-lc-rs` crate feature.
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    pub fn with_rustls_aws_lc_rs_crypto_provider(self) -> Self {
+        self.with_rustls_crypto_provider(rustls::crypto::aws_lc_rs::default_provider())
+    }
+
+    /// Use rustls's `ring` crypto provider.
+    ///
+    /// Requires the `rustls-ring` crate feature.
+    #[cfg(feature = "rustls-ring")]
+    pub fn with_rustls_ring_crypto_provider(self) -> Self {
+        self.with_rustls_crypto_provider(rustls::crypto::ring::default_provider())
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "_hidden")]
     pub fn with_user_agent(self, user_agent: impl Into<String>) -> Result<Self, ValidationError> {
@@ -491,6 +529,21 @@ impl S2Config {
             .map_err(|e| ValidationError(format!("invalid user agent: {e}")))?;
         Ok(Self { user_agent, ..self })
     }
+}
+
+#[cfg(feature = "rustls-aws-lc-rs")]
+fn default_rustls_crypto_provider() -> Option<Arc<rustls::crypto::CryptoProvider>> {
+    Some(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+#[cfg(all(not(feature = "rustls-aws-lc-rs"), feature = "rustls-ring"))]
+fn default_rustls_crypto_provider() -> Option<Arc<rustls::crypto::CryptoProvider>> {
+    Some(Arc::new(rustls::crypto::ring::default_provider()))
+}
+
+#[cfg(all(not(feature = "rustls-aws-lc-rs"), not(feature = "rustls-ring")))]
+fn default_rustls_crypto_provider() -> Option<Arc<rustls::crypto::CryptoProvider>> {
+    None
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
