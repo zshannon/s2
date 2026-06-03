@@ -23,6 +23,7 @@ pub async fn is_revoked(
         durability_filter: slatedb::config::DurabilityLevel::Remote,
         dirty: false,
         cache_blocks: true,
+        filter_context: None,
     };
 
     for id in revocation_ids {
@@ -51,6 +52,7 @@ pub async fn list_revocations(db: &slatedb::Db) -> Result<Vec<String>, Revocatio
         cache_blocks: true,
         max_fetch_tasks: 1,
         order: IterationOrder::Ascending,
+        filter_context: None,
     };
 
     let mut ids = Vec::new();

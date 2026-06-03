@@ -10,7 +10,7 @@ use s2_common::{
         access::Operation,
         basin::BasinName,
         config::{OptionalStreamConfig, StreamReconfiguration},
-        resources::{CreateMode, Page, RequestToken},
+        resources::{PROVISION_RESULT_HEADER, Page, ProvisionMode, ProvisionResult, RequestToken},
         stream::{ListStreamsRequest, StreamName},
     },
 };
@@ -49,10 +49,7 @@ pub fn router() -> axum::Router<AppState> {
         .route(super::paths::streams::LIST, get(list_streams))
         .route(super::paths::streams::CREATE, post(create_stream))
         .route(super::paths::streams::GET_CONFIG, get(get_stream_config))
-        .route(
-            super::paths::streams::CREATE_OR_RECONFIGURE,
-            put(create_or_reconfigure_stream),
-        )
+        .route(super::paths::streams::ENSURE, put(ensure_stream))
         .route(super::paths::streams::DELETE, delete(delete_stream))
         .route(
             super::paths::streams::RECONFIGURE,
@@ -154,7 +151,14 @@ pub async fn create_stream(
         basin,
         request,
     }: CreateArgs,
-) -> Result<(StatusCode, Json<v1t::stream::StreamInfo>), ServiceError> {
+) -> Result<
+    (
+        StatusCode,
+        [(http::HeaderName, &'static str); 1],
+        Json<v1t::stream::StreamInfo>,
+    ),
+    ServiceError,
+> {
     authorize_op(
         auth.as_ref().map(|e| &e.0),
         &auth_state,
@@ -169,14 +173,24 @@ pub async fn create_stream(
         .transpose()?
         .unwrap_or_default();
     let info = backend
-        .create_stream(
+        .provision_stream(
             basin,
             request.stream,
             config,
-            CreateMode::CreateOnly(request_token),
+            ProvisionMode::CreateOnly { request_token },
         )
-        .await?;
-    Ok((StatusCode::CREATED, Json(info.into_inner().into())))
+        .await?
+        .map(Into::into);
+    let (outcome, info) = match info {
+        ProvisionResult::Created(info) => ("created", info),
+        ProvisionResult::Noop(info) => ("noop", info),
+        ProvisionResult::Updated(_) => unreachable!("CreateOnly mode never produces Updated"),
+    };
+    Ok((
+        StatusCode::CREATED,
+        [(PROVISION_RESULT_HEADER.clone(), outcome)],
+        Json(info),
+    ))
 }
 
 #[derive(FromRequest)]
@@ -224,28 +238,25 @@ pub async fn get_stream_config(
         Operation::GetStreamConfig,
     )?;
 
-    let config = backend.get_stream_config(basin, stream).await?;
-    Ok(Json(
-        v1t::config::StreamConfig::to_opt(config).unwrap_or_default(),
-    ))
+    Ok(Json(backend.get_stream_config(basin, stream).await?.into()))
 }
 
 #[derive(FromRequest)]
 #[from_request(rejection(ServiceError))]
-pub struct CreateOrReconfigureArgs {
+pub struct EnsureArgs {
     #[from_request(via(Header))]
     basin: BasinName,
     #[from_request(via(Path))]
     stream: StreamName,
-    config: JsonOpt<v1t::config::StreamReconfiguration>,
+    config: JsonOpt<v1t::config::StreamConfig>,
 }
 
-/// Create or reconfigure a stream.
+/// Ensure a stream.
 #[cfg_attr(feature = "utoipa", utoipa::path(
     put,
-    path = super::paths::streams::CREATE_OR_RECONFIGURE,
+    path = super::paths::streams::ENSURE,
     tag = super::paths::streams::TAG,
-    request_body = Option<v1t::config::StreamReconfiguration>,
+    request_body = Option<v1t::config::StreamConfig>,
     params(v1t::StreamNamePathSegment),
     responses(
         (status = StatusCode::OK, body = v1t::stream::StreamInfo),
@@ -264,17 +275,23 @@ pub struct CreateOrReconfigureArgs {
         ), description = "Endpoint for the basin"),
     )
 ))]
-pub async fn create_or_reconfigure_stream(
+pub async fn ensure_stream(
     State(backend): State<Backend>,
     State(auth_state): State<AuthState>,
     auth: Option<Extension<AuthenticatedRequest>>,
-    CreateOrReconfigureArgs {
+    EnsureArgs {
         basin,
         stream,
         config: JsonOpt(config),
-    }: CreateOrReconfigureArgs,
-) -> Result<(StatusCode, Json<v1t::stream::StreamInfo>), ServiceError> {
-    // This operation can either create or reconfigure - check create permission
+    }: EnsureArgs,
+) -> Result<
+    (
+        StatusCode,
+        [(http::HeaderName, &'static str); 1],
+        Json<v1t::stream::StreamInfo>,
+    ),
+    ServiceError,
+> {
     authorize_op(
         auth.as_ref().map(|e| &e.0),
         &auth_state,
@@ -283,19 +300,24 @@ pub async fn create_or_reconfigure_stream(
         Operation::CreateStream,
     )?;
 
-    let config: StreamReconfiguration = config
+    let config: OptionalStreamConfig = config
         .map(TryInto::try_into)
         .transpose()?
         .unwrap_or_default();
     let info = backend
-        .create_stream(basin, stream, config, CreateMode::CreateOrReconfigure)
-        .await?;
-    let status = if info.is_created() {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
+        .provision_stream(basin, stream, config, ProvisionMode::Ensure)
+        .await?
+        .map(Into::into);
+    let (status, outcome, info) = match info {
+        ProvisionResult::Created(info) => (StatusCode::CREATED, "created", info),
+        ProvisionResult::Updated(info) => (StatusCode::OK, "updated", info),
+        ProvisionResult::Noop(info) => (StatusCode::OK, "noop", info),
     };
-    Ok((status, Json(info.into_inner().into())))
+    Ok((
+        status,
+        [(PROVISION_RESULT_HEADER.clone(), outcome)],
+        Json(info),
+    ))
 }
 
 #[derive(FromRequest)]
@@ -314,6 +336,7 @@ pub struct DeleteArgs {
     tag = super::paths::streams::TAG,
     responses(
         (status = StatusCode::ACCEPTED),
+        (status = StatusCode::CONFLICT, body = v1t::error::ErrorInfo),
         (status = StatusCode::NOT_FOUND, body = v1t::error::ErrorInfo),
         (status = StatusCode::BAD_REQUEST, body = v1t::error::ErrorInfo),
         (status = StatusCode::FORBIDDEN, body = v1t::error::ErrorInfo),
@@ -402,7 +425,5 @@ pub async fn reconfigure_stream(
     let config = backend
         .reconfigure_stream(basin, stream, reconfiguration)
         .await?;
-    Ok(Json(
-        v1t::config::StreamConfig::to_opt(config).unwrap_or_default(),
-    ))
+    Ok(Json(config.into()))
 }

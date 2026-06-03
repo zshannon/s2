@@ -17,10 +17,10 @@ use s2_common::{
 use crate::{
     auth::{AuthorizeError, RevocationError, SignatureError, TokenBuildError, VerifyError},
     backend::error::{
-        AppendConditionFailedError, AppendError, CheckTailError, CreateBasinError,
-        CreateStreamError, DeleteBasinError, DeleteStreamError, GetBasinConfigError,
-        GetStreamConfigError, ListBasinsError, ListStreamsError, ReadError, ReconfigureBasinError,
-        ReconfigureStreamError,
+        AppendConditionFailedError, AppendError, CheckTailError, DeleteBasinError,
+        DeleteStreamError, GetBasinConfigError, GetStreamConfigError, ListBasinsError,
+        ListStreamsError, ProvisionBasinError, ProvisionStreamError, ReadError,
+        ReconfigureBasinError, ReconfigureStreamError,
     },
 };
 
@@ -43,7 +43,7 @@ pub enum ServiceError {
     #[error(transparent)]
     ListBasins(#[from] ListBasinsError),
     #[error(transparent)]
-    CreateBasin(#[from] CreateBasinError),
+    ProvisionBasin(#[from] ProvisionBasinError),
     #[error(transparent)]
     GetBasinConfig(#[from] GetBasinConfigError),
     #[error(transparent)]
@@ -53,7 +53,7 @@ pub enum ServiceError {
     #[error(transparent)]
     ListStreams(#[from] ListStreamsError),
     #[error(transparent)]
-    CreateStream(#[from] CreateStreamError),
+    ProvisionStream(#[from] ProvisionStreamError),
     #[error(transparent)]
     GetStreamConfig(#[from] GetStreamConfigError),
     #[error(transparent)]
@@ -118,12 +118,15 @@ impl ServiceError {
             ServiceError::ListBasins(e) => match e {
                 ListBasinsError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
             },
-            ServiceError::CreateBasin(e) => match e {
-                CreateBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
-                CreateBasinError::BasinAlreadyExists(e) => {
+            ServiceError::ProvisionBasin(e) => match e {
+                ProvisionBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ProvisionBasinError::TransactionConflict(e) => {
+                    standard(ErrorCode::TransactionConflict, e.to_string())
+                }
+                ProvisionBasinError::BasinAlreadyExists(e) => {
                     standard(ErrorCode::ResourceAlreadyExists, e.to_string())
                 }
-                CreateBasinError::BasinDeletionPending(e) => {
+                ProvisionBasinError::BasinDeletionPending(e) => {
                     standard(ErrorCode::BasinDeletionPending, e.to_string())
                 }
             },
@@ -135,6 +138,9 @@ impl ServiceError {
             },
             ServiceError::DeleteBasin(e) => match e {
                 DeleteBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                DeleteBasinError::TransactionConflict(e) => {
+                    standard(ErrorCode::TransactionConflict, e.to_string())
+                }
                 DeleteBasinError::BasinNotFound(e) => {
                     standard(ErrorCode::BasinNotFound, e.to_string())
                 }
@@ -154,24 +160,24 @@ impl ServiceError {
             ServiceError::ListStreams(e) => match e {
                 ListStreamsError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
             },
-            ServiceError::CreateStream(e) => match e {
-                CreateStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
-                CreateStreamError::TransactionConflict(e) => {
+            ServiceError::ProvisionStream(e) => match e {
+                ProvisionStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ProvisionStreamError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
-                CreateStreamError::BasinNotFound(e) => {
+                ProvisionStreamError::BasinNotFound(e) => {
                     standard(ErrorCode::BasinNotFound, e.to_string())
                 }
-                CreateStreamError::BasinDeletionPending(e) => {
+                ProvisionStreamError::BasinDeletionPending(e) => {
                     standard(ErrorCode::BasinDeletionPending, e.to_string())
                 }
-                CreateStreamError::StreamAlreadyExists(e) => {
+                ProvisionStreamError::StreamAlreadyExists(e) => {
                     standard(ErrorCode::ResourceAlreadyExists, e.to_string())
                 }
-                CreateStreamError::StreamDeletionPending(e) => {
+                ProvisionStreamError::StreamDeletionPending(e) => {
                     standard(ErrorCode::StreamDeletionPending, e.to_string())
                 }
-                CreateStreamError::Validation(e) => standard(ErrorCode::Invalid, e.to_string()),
+                ProvisionStreamError::Validation(e) => standard(ErrorCode::Invalid, e.to_string()),
             },
             ServiceError::GetStreamConfig(e) => match e {
                 GetStreamConfigError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
@@ -184,6 +190,9 @@ impl ServiceError {
             },
             ServiceError::DeleteStream(e) => match e {
                 DeleteStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                DeleteStreamError::TransactionConflict(e) => {
+                    standard(ErrorCode::TransactionConflict, e.to_string())
+                }
                 DeleteStreamError::StreamerMissingInActionError(e) => {
                     standard(ErrorCode::Unavailable, e.to_string())
                 }
@@ -203,6 +212,9 @@ impl ServiceError {
                 }
                 ReconfigureStreamError::BasinNotFound(e) => {
                     standard(ErrorCode::BasinNotFound, e.to_string())
+                }
+                ReconfigureStreamError::BasinDeletionPending(e) => {
+                    standard(ErrorCode::BasinDeletionPending, e.to_string())
                 }
                 ReconfigureStreamError::StreamNotFound(e) => {
                     standard(ErrorCode::StreamNotFound, e.to_string())

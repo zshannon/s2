@@ -147,6 +147,9 @@ pub(crate) fn op_to_string(op: Operation) -> &'static str {
         Operation::AccountMetrics => "account_metrics",
         Operation::BasinMetrics => "basin_metrics",
         Operation::StreamMetrics => "stream_metrics",
+        Operation::ListLocations => "list_locations",
+        Operation::GetDefaultLocation => "get_default_location",
+        Operation::SetDefaultLocation => "set_default_location",
     }
 }
 

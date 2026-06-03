@@ -4,6 +4,7 @@ use tower_http::{compression::CompressionLayer, decompression::RequestDecompress
 pub mod access_tokens;
 pub mod basins;
 mod error;
+pub mod locations;
 pub mod metrics;
 pub mod middleware;
 pub mod paths;
@@ -27,6 +28,7 @@ pub fn router(app_state: &AppState) -> axum::Router<AppState> {
         .merge(basins::router())
         .merge(streams::router())
         .merge(records::router())
+        .merge(locations::router())
         .merge(metrics::router())
         .merge(access_tokens::router())
         .route_layer(from_fn_with_state(
