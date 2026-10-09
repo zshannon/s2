@@ -29,6 +29,7 @@ impl Backend {
         &self,
         request: ListBasinsRequest,
     ) -> Result<Page<BasinInfo>, ListBasinsError> {
+        self.authorize(s2_common::access::Operation::ListBasins, None, None)?;
         let ListBasinsRequest {
             prefix,
             start_after,
@@ -52,6 +53,16 @@ impl Backend {
             let basin = kv::basin_meta::deser_key(kv.key)?;
             assert!(basin.as_ref() > start_after.as_ref());
             assert!(basin.as_ref() >= prefix.as_ref());
+            if self
+                .authorize(
+                    s2_common::access::Operation::ListBasins,
+                    Some(basin.as_ref()),
+                    None,
+                )
+                .is_err()
+            {
+                continue;
+            }
             if basins.len() == limit.as_usize() {
                 has_more = true;
                 break;
@@ -85,6 +96,12 @@ impl Backend {
         })
         .await?
         .unzip();
+        let permission = if existing_meta.is_some() && matches!(mode, ProvisionMode::Ensure) {
+            s2_common::access::Operation::ReconfigureBasin
+        } else {
+            s2_common::access::Operation::CreateBasin
+        };
+        self.authorize(permission, Some(basin.as_ref()), None)?;
         if let Some(existing_meta) = &existing_meta
             && existing_meta.deleted_at.is_some()
         {
@@ -168,6 +185,11 @@ impl Backend {
         &self,
         basin: BasinName,
     ) -> Result<BasinConfig, GetBasinConfigError> {
+        self.authorize(
+            s2_common::access::Operation::GetBasinConfig,
+            Some(basin.as_ref()),
+            None,
+        )?;
         let Some(meta) = self
             .db_get(kv::basin_meta::ser_key(&basin), kv::basin_meta::deser_value)
             .await?
@@ -182,6 +204,11 @@ impl Backend {
         basin: BasinName,
         reconfig: BasinReconfiguration,
     ) -> Result<BasinConfig, ReconfigureBasinError> {
+        self.authorize(
+            s2_common::access::Operation::ReconfigureBasin,
+            Some(basin.as_ref()),
+            None,
+        )?;
         let meta_key = kv::basin_meta::ser_key(&basin);
 
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
@@ -204,6 +231,11 @@ impl Backend {
     }
 
     pub async fn delete_basin(&self, basin: BasinName) -> Result<(), DeleteBasinError> {
+        self.authorize(
+            s2_common::access::Operation::DeleteBasin,
+            Some(basin.as_ref()),
+            None,
+        )?;
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
         let meta_key = kv::basin_meta::ser_key(&basin);
         let Some((mut meta, seq)) = db_txn_get_with(&txn, &meta_key, |entry| {

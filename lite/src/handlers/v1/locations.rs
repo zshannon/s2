@@ -1,7 +1,7 @@
 use axum::extract::{FromRequest, State};
 use s2_api::{data::Json, v1 as v1t};
 
-use crate::{backend::Backend, handlers::v1::error::ServiceError};
+use crate::{backend::Backend, handlers::v1::error::ServiceError, pki::AuthContext};
 
 pub fn router() -> axum::Router<Backend> {
     use axum::routing::{get, put};
@@ -25,7 +25,9 @@ pub fn router() -> axum::Router<Backend> {
 ))]
 pub async fn list_locations(
     State(_backend): State<Backend>,
+    auth: AuthContext,
 ) -> Result<Json<Vec<v1t::location::LocationInfo>>, ServiceError> {
+    auth.authorize(s2_common::access::Operation::ListLocations, None, None)?;
     Err(ServiceError::NotImplemented)
 }
 
@@ -42,7 +44,9 @@ pub async fn list_locations(
 ))]
 pub async fn get_default_location(
     State(_backend): State<Backend>,
+    auth: AuthContext,
 ) -> Result<Json<v1t::location::GetDefaultLocationResponse>, ServiceError> {
+    auth.authorize(s2_common::access::Operation::GetDefaultLocation, None, None)?;
     Err(ServiceError::NotImplemented)
 }
 
@@ -68,7 +72,9 @@ pub struct SetDefaultArgs {
 ))]
 pub async fn set_default_location(
     State(_backend): State<Backend>,
+    auth: AuthContext,
     SetDefaultArgs { .. }: SetDefaultArgs,
 ) -> Result<Json<v1t::location::GetDefaultLocationResponse>, ServiceError> {
+    auth.authorize(s2_common::access::Operation::SetDefaultLocation, None, None)?;
     Err(ServiceError::NotImplemented)
 }

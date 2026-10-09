@@ -6,3 +6,5 @@ pub mod init;
 pub mod metrics;
 pub mod server;
 pub mod stream_id;
+
+pub mod pki;

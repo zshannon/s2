@@ -115,3 +115,6 @@ pub mod append_session {
 pub mod read_session {
     pub use crate::session::read::ReadSession;
 }
+
+/// PKI credential, grant, and signature primitives.
+pub use s2_pki_auth as pki;

@@ -35,6 +35,11 @@ impl Backend {
         basin: &BasinName,
         stream: &StreamName,
     ) -> Result<StreamHandle, CheckTailError> {
+        self.authorize(
+            s2_common::access::Operation::CheckTail,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         self.stream_handle_with_auto_create::<CheckTailError>(
             basin,
             stream,
@@ -56,6 +61,11 @@ impl Backend {
         encryption_key: Option<EncryptionKey>,
         stream_config: OptionalStreamConfig,
     ) -> Result<StreamHandle, ReadError> {
+        self.authorize(
+            s2_common::access::Operation::Read,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         self.stream_handle_with_auto_create::<ReadError>(
             basin,
             stream,

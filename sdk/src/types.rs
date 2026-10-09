@@ -118,6 +118,7 @@ pub trait AccessTokenProvider: fmt::Debug + Send + Sync {
 
 #[derive(Clone)]
 pub(crate) enum AccessToken {
+    Pki(Arc<s2_pki_auth::PkiCredentials>),
     Static(SecretString),
     #[cfg(feature = "_hidden")]
     Provider(Arc<dyn AccessTokenProvider>),
@@ -125,6 +126,7 @@ pub(crate) enum AccessToken {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessTokenMode {
+    Pki,
     Static,
     #[cfg(feature = "_hidden")]
     Refreshable,
@@ -133,7 +135,7 @@ pub(crate) enum AccessTokenMode {
 impl AccessTokenMode {
     pub(crate) fn is_refreshable(self) -> bool {
         match self {
-            Self::Static => false,
+            Self::Static | Self::Pki => false,
             #[cfg(feature = "_hidden")]
             Self::Refreshable => true,
         }
@@ -144,6 +146,7 @@ impl AccessToken {
     pub(crate) fn mode(&self) -> AccessTokenMode {
         match self {
             Self::Static(_) => AccessTokenMode::Static,
+            Self::Pki(_) => AccessTokenMode::Pki,
             #[cfg(feature = "_hidden")]
             Self::Provider(_) => AccessTokenMode::Refreshable,
         }
@@ -154,6 +157,7 @@ impl fmt::Debug for AccessToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Static(_) => formatter.write_str("Static(<redacted>)"),
+            Self::Pki(_) => formatter.write_str("Pki(<redacted>)"),
             #[cfg(feature = "_hidden")]
             Self::Provider(_) => formatter.write_str("Provider(<redacted>)"),
         }
@@ -624,8 +628,17 @@ pub struct S2Config {
 impl S2Config {
     /// Create a new [`S2Config`] with the given access token and default settings.
     pub fn new(access_token: impl Into<String>) -> Self {
+        Self::with_authentication(AccessToken::Static(access_token.into().into()))
+    }
+
+    /// Authenticate exclusively with client HTTP signatures and a Biscuit grant.
+    pub fn new_pki(credentials: s2_pki_auth::PkiCredentials) -> Self {
+        Self::with_authentication(AccessToken::Pki(Arc::new(credentials)))
+    }
+
+    fn with_authentication(access_token: AccessToken) -> Self {
         Self {
-            access_token: AccessToken::Static(access_token.into().into()),
+            access_token,
             endpoints: S2Endpoints::for_cloud(),
             http2: Http2Config::new(),
             connection_timeout: Duration::from_secs(3),

@@ -43,6 +43,7 @@ rcgen = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
 s2-api = { workspace = true, features = ["axum"] }
 s2-common = { workspace = true, features = ["clap"] }
+s2-pki-auth = { version = "0.1.0", path = "../pki-auth" }
 s2-resource-spec = { workspace = true }
 s2-storage = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -66,6 +67,7 @@ tikv-jemallocator = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 rstest = { workspace = true }
+s2-sdk = { path = "../sdk" }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 tower = "0.5"
 uuid = { workspace = true, features = ["v4"] }

@@ -614,3 +614,59 @@ fn only_account_endpoint_set_warns_and_uses_defaults() {
         "stderr should not report an endpoint parse error, got: {stderr}"
     );
 }
+
+#[test]
+fn pki_credentials_replace_environment_bearer_tokens_and_keep_keys_out_of_config() {
+    use s2_common::access::Operation;
+    use s2_pki_auth::*;
+    let env = TestEnv::new();
+    let server = TestServer::start();
+    let issuer = ClientKey::generate();
+    let client = ClientKey::generate();
+    let grant = issue_grant(
+        &issuer,
+        &client.public_key(),
+        &server.endpoint,
+        &GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::ListBasins],
+        ),
+        2_000_000_000,
+    )
+    .unwrap();
+    let key_file = env.home.path().join("client.key");
+    let grant_file = env.home.path().join("grant.json");
+    std::fs::write(&key_file, client.to_base58()).unwrap();
+    std::fs::write(
+        &grant_file,
+        serde_json::json!({"issuer":issuer.public_key().to_base58(),"grant":grant.to_base64()})
+            .to_string(),
+    )
+    .unwrap();
+    env.s2()
+        .args([
+            "auth",
+            "pki",
+            "set",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--grant-file",
+            grant_file.to_str().unwrap(),
+            "--insecure-storage",
+        ])
+        .assert()
+        .success();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    assert!(!config.contains(&client.to_base58()));
+    assert!(config.contains("pki"));
+    env.s2()
+        .args(["list-basins"])
+        .env("S2_ACCESS_TOKEN", "invalid-bearer-must-be-ignored")
+        .assert()
+        .success();
+    let observed = server.finish();
+    assert!(observed.contains("authorization: Biscuit "));
+    assert!(observed.contains("signature-input: s2="));
+    assert!(!observed.contains("invalid-bearer"));
+}

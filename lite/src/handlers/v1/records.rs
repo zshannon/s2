@@ -25,6 +25,7 @@ use s2_common::{
 use crate::{
     backend::{Backend, error::ReadError},
     handlers::v1::error::ServiceError,
+    pki::AuthContext,
 };
 
 pub fn router() -> axum::Router<Backend> {
@@ -121,8 +122,10 @@ pub struct CheckTailArgs {
 ))]
 pub async fn check_tail(
     State(backend): State<Backend>,
+    auth: AuthContext,
     CheckTailArgs { basin, stream }: CheckTailArgs,
 ) -> Result<Json<v1t::stream::TailResponse>, ServiceError> {
+    let backend = auth.scope(backend);
     let tail = backend
         .open_for_check_tail(&basin, &stream)
         .await?
@@ -180,6 +183,7 @@ pub struct ReadArgs {
 ))]
 pub async fn read(
     State(backend): State<Backend>,
+    auth: AuthContext,
     ReadArgs {
         basin,
         stream,
@@ -188,6 +192,7 @@ pub async fn read(
         request,
     }: ReadArgs,
 ) -> Result<Response, ServiceError> {
+    let backend = auth.scope(backend);
     let start: ReadStart = start.try_into()?;
     match request {
         v1t::stream::ReadRequest::Unary {
@@ -385,12 +390,14 @@ pub struct AppendArgs {
 ))]
 pub async fn append(
     State(backend): State<Backend>,
+    auth: AuthContext,
     AppendArgs {
         basin,
         stream,
         request,
     }: AppendArgs,
 ) -> Result<Response, ServiceError> {
+    let backend = auth.scope(backend);
     match request {
         v1t::stream::AppendRequest::Unary {
             encryption_key,

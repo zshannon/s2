@@ -28,6 +28,7 @@ This repository contains:
 - **[s2-cli](cli/)** - Command-line interface for S2
 - **[s2-lite](lite/)** - Open source, self-hostable server implementation of the [S2 API](https://s2.dev/docs/api)
 - **[s2-sdk](sdk/)** - Rust SDK for S2
+- **[s2-pki-auth](pki-auth/)** - HTTP Message Signatures and Biscuit authorization
 
 ## Development
 
@@ -73,6 +74,11 @@ docker pull ghcr.io/s2-streamstore/s2
 ```
 
 ## Authentication
+
+This fork supports exclusive PKI authentication for Lite, the Rust SDK, and the
+CLI. See [the PKI v2 protocol and setup guide](pki-auth/README.md) for client
+keys, issuer grants, signed delegation, and revocation.
+
 
 Store an access token in the OS credential store:
 

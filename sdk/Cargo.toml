@@ -41,6 +41,7 @@ rand = { workspace = true }
 rustls = { workspace = true }
 s2-api = { workspace = true }
 s2-common = { workspace = true }
+s2-pki-auth = { version = "0.1.0", path = "../pki-auth" }
 secrecy = "0.10"
 serde = { workspace = true }
 serde_json = { workspace = true }

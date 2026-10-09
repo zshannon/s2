@@ -30,6 +30,11 @@ impl Backend {
         encryption_key: Option<EncryptionKey>,
         stream_config: OptionalStreamConfig,
     ) -> Result<StreamHandle, AppendError> {
+        self.authorize(
+            s2_common::access::Operation::Append,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         self.stream_handle_with_auto_create::<AppendError>(
             basin,
             stream,
@@ -43,6 +48,7 @@ impl Backend {
 
 impl StreamHandle {
     pub async fn append(self, input: AppendInput) -> Result<AppendAck, AppendError> {
+        check_append(&self.db, self.pki.as_ref(), &input).await?;
         let input =
             encrypt_append_input(input, &self.encryption, self.client.stream_id().as_bytes());
         let ack = self.client.append_permit(input).await?.submit().await?;
@@ -54,6 +60,8 @@ impl StreamHandle {
         S: Stream<Item = AppendInput>,
     {
         let stream_id = self.client.stream_id();
+        let pki = self.pki.clone();
+        let db = self.db.clone();
         let StreamHandle {
             client, encryption, ..
         } = self;
@@ -65,6 +73,7 @@ impl StreamHandle {
             loop {
                 tokio::select! {
                     Some(input) = inputs.next(), if permit_opt.is_none() => {
+                        if let Err(error)=check_append(&db,pki.as_ref(),&input).await {yield Err(error);break}
                         permit_opt = Some(Box::pin(client.append_permit(
                             encrypt_append_input(input, &encryption, stream_id.as_bytes()),
                         )));
@@ -283,6 +292,36 @@ impl BlockedReplySender {
         };
         let _ = self.tx.send(reply);
     }
+}
+
+async fn check_append(
+    db: &slatedb::Db,
+    pki: Option<&(s2_pki_auth::VerifiedRequest, BasinName, StreamName)>,
+    input: &AppendInput,
+) -> Result<(), AppendError> {
+    if let Some((identity, basin, stream)) = pki {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        identity
+            .authorize(
+                s2_common::access::Operation::Append,
+                Some(basin.as_ref()),
+                Some(stream.as_ref()),
+                now,
+            )
+            .map_err(|_| StorageError::PermissionDenied)?;
+        s2_pki_auth::authorize_append(
+            identity.capability(),
+            input,
+            basin.as_ref(),
+            stream.as_ref(),
+            now,
+        )
+        .map_err(|_| StorageError::PermissionDenied)?;
+        if !super::pki::not_revoked(db, identity.capability().revocation_identifiers()).await? {
+            return Err(StorageError::PermissionDenied.into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

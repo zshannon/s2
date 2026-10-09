@@ -2,7 +2,7 @@ use axum::extract::{FromRequest, Path, Query, State};
 use s2_api::{data::Json, v1 as v1t};
 use s2_common::{basin::BasinName, stream::StreamName};
 
-use crate::{backend::Backend, handlers::v1::error::ServiceError};
+use crate::{backend::Backend, handlers::v1::error::ServiceError, pki::AuthContext};
 
 pub fn router() -> axum::Router<Backend> {
     use axum::routing::get;
@@ -34,8 +34,10 @@ pub struct AccountArgs {
 ))]
 pub async fn account_metrics(
     State(_backend): State<Backend>,
+    auth: AuthContext,
     AccountArgs { .. }: AccountArgs,
 ) -> Result<Json<v1t::metrics::MetricSetResponse>, ServiceError> {
+    auth.authorize(s2_common::access::Operation::AccountMetrics, None, None)?;
     Err(ServiceError::NotImplemented)
 }
 
@@ -63,8 +65,14 @@ pub struct BasinArgs {
 ))]
 pub async fn basin_metrics(
     State(_backend): State<Backend>,
-    BasinArgs { .. }: BasinArgs,
+    auth: AuthContext,
+    BasinArgs { _basin: basin, .. }: BasinArgs,
 ) -> Result<Json<v1t::metrics::MetricSetResponse>, ServiceError> {
+    auth.authorize(
+        s2_common::access::Operation::BasinMetrics,
+        Some(basin.as_ref()),
+        None,
+    )?;
     Err(ServiceError::NotImplemented)
 }
 
@@ -92,7 +100,16 @@ pub struct StreamArgs {
 ))]
 pub async fn stream_metrics(
     State(_backend): State<Backend>,
-    StreamArgs { .. }: StreamArgs,
+    auth: AuthContext,
+    StreamArgs {
+        _basin_and_stream: (basin, stream),
+        ..
+    }: StreamArgs,
 ) -> Result<Json<v1t::metrics::MetricSetResponse>, ServiceError> {
+    auth.authorize(
+        s2_common::access::Operation::StreamMetrics,
+        Some(basin.as_ref()),
+        Some(stream.as_ref()),
+    )?;
     Err(ServiceError::NotImplemented)
 }

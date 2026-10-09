@@ -119,7 +119,8 @@ fn replacement_grant_reuse_requires_the_same_known_identity() {
 #[test]
 fn production_browser_credentials_are_bound_to_production_transport() {
     let mut credential = ResolvedCredential {
-        access_token: "access".to_owned().into(),
+        pki: None,
+        access_token: Some("access".to_owned().into()),
         source: TokenSource::BrowserLogin,
         oauth_session: Some(oauth_session()),
         oauth_tokens: None,

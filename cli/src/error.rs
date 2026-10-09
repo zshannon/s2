@@ -55,6 +55,8 @@ impl SdkError {
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum CliError {
+    #[error("PKI: {0}")]
+    Pki(String),
     #[error(transparent)]
     #[diagnostic(transparent)]
     Config(#[from] CliConfigError),
@@ -220,6 +222,7 @@ pub enum S2UriParseError {
 
 #[derive(Debug, Clone, Copy)]
 pub enum TokenSource {
+    Pki,
     Environment,
     BrowserLogin,
     StoredAccessToken,
@@ -229,6 +232,7 @@ pub enum TokenSource {
 impl std::fmt::Display for TokenSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TokenSource::Pki => write!(f, "PKI client key and Biscuit grant"),
             TokenSource::Environment => write!(f, "environment (S2_ACCESS_TOKEN)"),
             TokenSource::BrowserLogin => write!(f, "browser login"),
             TokenSource::StoredAccessToken => write!(f, "stored access token"),
@@ -296,6 +300,8 @@ impl From<String> for RecordParseError {
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum CliConfigError {
+    #[error("PKI credentials are not configured; run s2 auth pki set")]
+    PkiNotConfigured,
     #[error("Failed to find a home for config directory")]
     DirNotFound,
 

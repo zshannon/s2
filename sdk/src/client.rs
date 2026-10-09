@@ -157,6 +157,25 @@ pub struct Request {
 }
 
 impl Request {
+    pub(crate) fn sign_pki(
+        &mut self,
+        credentials: &s2_pki_auth::PkiCredentials,
+    ) -> Result<(), s2_pki_auth::AuthError> {
+        let body = match &self.body.0 {
+            BodyInner::Empty => s2_pki_auth::RequestBody::Unary(b""),
+            BodyInner::Full(bytes) => s2_pki_auth::RequestBody::Unary(bytes),
+            BodyInner::Streaming(_) => s2_pki_auth::RequestBody::Streaming,
+        };
+        s2_pki_auth::sign_request(
+            credentials,
+            &self.method,
+            &self.uri,
+            &mut self.headers,
+            body,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+    }
+
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }

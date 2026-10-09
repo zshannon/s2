@@ -9,6 +9,19 @@ use axum::{
 use crate::backend::Backend;
 
 pub fn router() -> axum::Router<Backend> {
+    routes().layer(axum::Extension(crate::pki::AuthContext(None)))
+}
+
+pub fn router_with_pki(state: crate::pki::PkiAuthState) -> axum::Router<Backend> {
+    routes()
+        .merge(crate::pki::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::pki::authenticate,
+        ))
+}
+
+fn routes() -> axum::Router<Backend> {
     axum::Router::new()
         .route(/* bw compat */ "/ping", axum::routing::get(health))
         .route("/health", axum::routing::get(health))

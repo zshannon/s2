@@ -38,6 +38,7 @@ rustls = { workspace = true, features = ["aws-lc-rs"] }
 s2-api = { workspace = true }
 s2-common = { workspace = true }
 s2-lite = { workspace = true }
+s2-pki-auth = { version = "0.1.0", path = "../pki-auth" }
 s2-resource-spec = { workspace = true }
 s2-sdk = { workspace = true, features = ["_hidden"] }
 secrecy = { workspace = true }

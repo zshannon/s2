@@ -39,6 +39,13 @@ pub struct TlsConfig {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct LiteArgs {
+    /// Trusted base58 P-256 issuer public keys. Enables exclusive PKI authentication.
+    #[arg(long, value_delimiter = ',', requires = "pki_audience")]
+    pub pki_issuer: Vec<String>,
+    /// Canonical external origin used by PKI grants and request signatures.
+    #[arg(long, requires = "pki_issuer")]
+    pub pki_audience: Option<String>,
+
     /// Name of the S3 bucket to back the database.
     ///
     /// If not specified, in-memory storage is used unless --local-root is set.
@@ -261,7 +268,21 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
         init::apply(&backend, spec).await?;
     }
 
-    let mut app = handlers::router()
+    let router = if let Some(audience) = args.pki_audience {
+        let issuers = args
+            .pki_issuer
+            .iter()
+            .map(|key| s2_pki_auth::ClientPublicKey::from_base58(key))
+            .collect::<s2_pki_auth::Result<Vec<_>>>()?;
+        handlers::router_with_pki(crate::pki::PkiAuthState::new(
+            backend.clone(),
+            s2_pki_auth::TrustedIssuers::new(issuers),
+            audience,
+        )?)
+    } else {
+        handlers::router()
+    };
+    let mut app = router
         .with_state(backend)
         .layer(
             TraceLayer::new_for_http()
@@ -271,6 +292,8 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
         )
         .layer(SetSensitiveRequestHeadersLayer::new([
             AUTHORIZATION,
+            http::HeaderName::from_static("signature"),
+            http::HeaderName::from_static("signature-input"),
             S2_ENCRYPTION_KEY_HEADER.clone(),
         ]));
 

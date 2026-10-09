@@ -47,6 +47,7 @@ enum StreamerClientSlot {
 
 #[derive(Clone)]
 pub struct Backend {
+    pub(super) pki: Option<s2_pki_auth::VerifiedRequest>,
     pub(super) db: slatedb::Db,
     streamer_slots: Arc<DashMap<StreamId, StreamerClientSlot>>,
     append_inflight_bytes_sema: Arc<Semaphore>,
@@ -65,6 +66,7 @@ impl Backend {
         ));
         let durability_notifier = DurabilityNotifier::spawn(&db);
         Self {
+            pki: None,
             db,
             streamer_slots: Arc::new(DashMap::new()),
             append_inflight_bytes_sema: append_inflight_bytes,
@@ -384,6 +386,11 @@ impl Backend {
                     Err(GetBasinConfigError::Storage(e)) => Err(e)?,
                     Err(GetBasinConfigError::BasinNotFound(e)) => Err(e)?,
                 };
+                self.authorize(
+                    s2_common::access::Operation::CreateStream,
+                    Some(basin.as_ref()),
+                    Some(stream.as_ref()),
+                )?;
                 if !auto_create_on.is_enabled(&config) {
                     return Err(e.into());
                 }
@@ -415,6 +422,10 @@ impl Backend {
             Err(e) => return Err(e.into()),
         };
         Ok(StreamHandle {
+            pki: self
+                .pki
+                .clone()
+                .map(|identity| (identity, basin.clone(), stream.clone())),
             db: self.db.clone(),
             encryption: resolve_encryption(client.cipher())?,
             client,

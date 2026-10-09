@@ -38,7 +38,11 @@ pub async fn status() -> Result<ExitCode, CliError> {
         return Ok(ExitCode::FAILURE);
     }
 
-    let sdk = match sdk_config(&config, credential.access_token(), update::user_agent()) {
+    let sdk = match sdk_config(
+        &config,
+        credential.initial_sdk_config(),
+        update::user_agent(),
+    ) {
         Ok(sdk) => credential.configure_sdk(sdk),
         Err(error) => {
             print_unverified(&label, &error);
@@ -58,7 +62,8 @@ pub async fn status() -> Result<ExitCode, CliError> {
 
     let exit_code = match result {
         Ok(_) => {
-            if uses_loopback_endpoints(&config) {
+            if uses_loopback_endpoints(&config) && !matches!(credential.source(), TokenSource::Pki)
+            {
                 print_local_connection();
             } else {
                 print_authenticated(&label);
@@ -140,6 +145,9 @@ fn configured_credential_label(config: &CliConfig) -> String {
 }
 
 fn configured_source(config: &CliConfig) -> Option<TokenSource> {
+    if config.auth_method == Some(crate::config::AuthMethod::Pki) {
+        return Some(TokenSource::Pki);
+    }
     if std::env::var_os("S2_ACCESS_TOKEN").is_some_and(|value| !value.is_empty()) {
         return Some(TokenSource::Environment);
     }
@@ -167,6 +175,7 @@ fn stored_access_token_source(config: &CliConfig) -> TokenSource {
 
 fn credential_label(config: &CliConfig, source: TokenSource) -> String {
     match source {
+        TokenSource::Pki => "PKI client key and Biscuit grant".to_owned(),
         TokenSource::Environment => "S2_ACCESS_TOKEN".to_owned(),
         TokenSource::BrowserLogin => browser_login_label(config),
         TokenSource::StoredAccessToken | TokenSource::ConfigFile => access_token_label(config),
@@ -245,6 +254,7 @@ fn print_configured_credentials(config: &CliConfig, active: Option<TokenSource>)
 
 fn recovery_command(source: TokenSource) -> &'static str {
     match source {
+        TokenSource::Pki => "Run `s2 auth pki set` to replace the key and grant.",
         TokenSource::BrowserLogin => "Run `s2 login` again.",
         TokenSource::Environment => "Set S2_ACCESS_TOKEN to a valid access token.",
         TokenSource::StoredAccessToken | TokenSource::ConfigFile => {

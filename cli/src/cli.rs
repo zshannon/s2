@@ -240,6 +240,9 @@ pub struct UpdateArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
+    /// Manage PKI keys, Biscuit grants and delegation.
+    #[command(subcommand)]
+    Pki(crate::pki::PkiCommand),
     /// Log in to S2 through your browser.
     Login(LoginArgs),
 
