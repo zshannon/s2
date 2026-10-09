@@ -65,6 +65,8 @@ utoipa = { workspace = true, optional = true, features = ["time"] }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+biscuit-auth = "6"
+bs58 = "0.5"
 proptest = { workspace = true }
 rstest = { workspace = true }
 s2-sdk = { path = "../sdk" }

@@ -27,6 +27,22 @@ impl Backend {
         }
         Ok(())
     }
+    pub(super) fn authorize_collection(
+        &self,
+        operation: Operation,
+        basin: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if let Some(identity) = &self.pki {
+            identity
+                .authorize_collection(
+                    operation,
+                    basin,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .map_err(|_| StorageError::PermissionDenied)?;
+        }
+        Ok(())
+    }
     pub async fn pki_not_revoked(&self, ids: &[Vec<u8>]) -> Result<bool, StorageError> {
         not_revoked(&self.db, ids).await
     }

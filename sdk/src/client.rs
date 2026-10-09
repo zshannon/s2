@@ -157,6 +157,9 @@ pub struct Request {
 }
 
 impl Request {
+    pub(crate) fn validate_pki_streaming_transport(&self) -> Result<(), s2_pki_auth::AuthError> {
+        s2_pki_auth::validate_streaming_transport(&self.uri)
+    }
     pub(crate) fn sign_pki(
         &mut self,
         credentials: &s2_pki_auth::PkiCredentials,

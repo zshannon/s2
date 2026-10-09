@@ -5753,6 +5753,8 @@ dependencies = [
  "aws-credential-types",
  "axum",
  "axum-server",
+ "biscuit-auth",
+ "bs58",
  "bytes",
  "bytesize",
  "clap",

@@ -956,6 +956,11 @@ impl BaseClient {
         request: client::Request,
     ) -> Result<(StreamingResponse, Option<String>), ApiError> {
         let mut request = request;
+        if self.pki_credentials.is_some() {
+            request.validate_pki_streaming_transport().map_err(|_| {
+                ClientError::Configuration("PKI streaming requires HTTPS or loopback HTTP".into())
+            })?;
+        }
         let access_token = self.authorize(&mut request).await?;
         let response = self
             .client
@@ -1506,6 +1511,64 @@ mod tests {
         assert_eq!(captured[0]["s2-pki-body"], "unary");
         assert!(captured[0].contains_key("content-digest"));
         assert_eq!(captured[0][http::header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn review_pki_streaming_requires_https_or_loopback_before_dispatch() {
+        use s2_pki_auth::*;
+        for origin in [
+            "http://remote.example",
+            "http://localhost",
+            "https://remote.example",
+        ] {
+            let issuer = ClientKey::generate();
+            let key = ClientKey::generate();
+            let grant = issue_grant(
+                &issuer,
+                &key.public_key(),
+                origin,
+                &GrantScope::new(
+                    ResourceScope::Any,
+                    ResourceScope::Any,
+                    vec![Operation::Read, Operation::Append],
+                ),
+                2_000_000_000,
+            )
+            .unwrap();
+            let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap());
+            let mut base = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
+            let executor = Arc::new(HeaderCapture::default());
+            base.client = executor.clone();
+            for append in [false, true] {
+                let uri = format!("{origin}/v1/streams/events/records")
+                    .parse()
+                    .unwrap();
+                let request = if append {
+                    base.post(uri)
+                        .header("content-type", "s2s/proto")
+                        .body(client::Body::wrap_stream(futures_util::stream::empty::<
+                            std::result::Result<bytes::Bytes, std::io::Error>,
+                        >()))
+                        .build()
+                        .unwrap()
+                } else {
+                    base.get(uri)
+                        .header("accept", "text/event-stream")
+                        .build()
+                        .unwrap()
+                };
+                let _ = base.init_streaming_authorized(request).await;
+            }
+            assert_eq!(
+                executor.streaming.lock().unwrap().len(),
+                if origin == "http://remote.example" {
+                    0
+                } else {
+                    2
+                }
+            );
+        }
     }
 
     #[cfg(feature = "_hidden")]

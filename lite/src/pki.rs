@@ -41,14 +41,30 @@ impl PkiAuthState {
             audience,
         })))
     }
-    async fn active(&self, identity: &VerifiedRequest) -> bool {
+    async fn active(&self, identity: &VerifiedRequest, policy: Option<&ReadPolicy>) -> bool {
         time::OffsetDateTime::now_utc().unix_timestamp() < identity.lease_expires_at()
+            && policy.is_none_or(|p| p.authorize(identity).is_ok())
             && self
                 .0
                 .backend
                 .pki_not_revoked(identity.capability().revocation_identifiers())
                 .await
                 .unwrap_or(false)
+    }
+}
+#[derive(Clone)]
+pub(crate) struct ReadPolicy {
+    pub basin: String,
+    pub stream: String,
+}
+impl ReadPolicy {
+    fn authorize(&self, identity: &VerifiedRequest) -> s2_pki_auth::Result<()> {
+        identity.authorize(
+            s2_pki_auth::Operation::Read,
+            Some(&self.basin),
+            Some(&self.stream),
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
     }
 }
 #[derive(Clone)]
@@ -128,16 +144,17 @@ pub(crate) async fn authenticate(
     {
         return error(ErrorCode::Authn);
     }
-    let streaming = request.method() == http::Method::POST
-        && original.path().ends_with("/records")
-        && request
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            == Some("s2s/proto");
-    if streaming
-        && target.scheme_str() != Some("https")
-        && !matches!(target.host(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    let content_type = s2_api::mime::content_type(request.headers());
+    let accept = s2_api::mime::accept(request.headers());
+    let records = original.path().ends_with("/records");
+    let proto = content_type
+        .as_ref()
+        .is_some_and(s2_api::mime::is_s2s_proto);
+    let streaming = request.method() == http::Method::POST && records && proto;
+    let streaming_read = request.method() == http::Method::GET
+        && records
+        && (proto || accept.as_ref().is_some_and(s2_api::mime::is_event_stream));
+    if (streaming || streaming_read) && s2_pki_auth::validate_streaming_transport(&target).is_err()
     {
         return error(ErrorCode::Authn);
     }
@@ -176,7 +193,7 @@ pub(crate) async fn authenticate(
             Err(_) => return error(ErrorCode::Authn),
         }
     };
-    if !state.active(&identity).await {
+    if !state.active(&identity, None).await {
         return error(ErrorCode::Authn);
     }
     match state.0.backend.pki_accept_nonce(&identity).await {
@@ -215,10 +232,11 @@ pub(crate) async fn authenticate(
     let response = loop {
         tokio::select! {
             response=&mut execution=>break response,
-            _=tick.tick()=>{if !state.active(&identity).await{return error(ErrorCode::Other)}}
+            _=tick.tick()=>{if !state.active(&identity, None).await{return error(ErrorCode::Other)}}
         }
     };
     // Revalidate even idle streams; dropping the body cancels the underlying session.
+    let policy = response.extensions().get::<ReadPolicy>().cloned();
     let (parts, body) = response.into_parts();
     let mut stream = body.into_data_stream();
     let output = async_stream::stream! {
@@ -226,8 +244,13 @@ pub(crate) async fn authenticate(
         loop {
             tokio::select! {
                 biased;
-                _=tick.tick()=>{if !state.active(&identity).await{yield Err(std::io::Error::other("PKI session expired or revoked"));break}},
-                data=stream.next()=>match data{Some(Ok(data))=>yield Ok(data),Some(Err(e))=>{yield Err(std::io::Error::other(e));break},None=>break}
+                _=tick.tick()=>{if !state.active(&identity, policy.as_ref()).await{yield Err(std::io::Error::other("PKI session expired or revoked"));break}},
+                data=stream.next()=>match data{Some(Ok(data))=>{
+                    if policy.as_ref().is_some_and(|p| p.authorize(&identity).is_err()) {
+                        yield Err(std::io::Error::other("PKI read policy denied")); break;
+                    }
+                    yield Ok(data)
+                },Some(Err(e))=>{yield Err(std::io::Error::other(e));break},None=>break}
             }
         }
     };

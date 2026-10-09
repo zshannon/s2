@@ -38,10 +38,9 @@ impl Backend {
         basin: BasinName,
         request: ListStreamsRequest,
     ) -> Result<Page<StreamInfo>, ListStreamsError> {
-        self.authorize(
+        self.authorize_collection(
             s2_common::access::Operation::ListStreams,
             Some(basin.as_ref()),
-            None,
         )?;
         let ListStreamsRequest {
             prefix,

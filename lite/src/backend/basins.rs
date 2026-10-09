@@ -29,7 +29,7 @@ impl Backend {
         &self,
         request: ListBasinsRequest,
     ) -> Result<Page<BasinInfo>, ListBasinsError> {
-        self.authorize(s2_common::access::Operation::ListBasins, None, None)?;
+        self.authorize_collection(s2_common::access::Operation::ListBasins, None)?;
         let ListBasinsRequest {
             prefix,
             start_after,
@@ -190,6 +190,13 @@ impl Backend {
             Some(basin.as_ref()),
             None,
         )?;
+        self.basin_config_internal(basin).await
+    }
+
+    pub(super) async fn basin_config_internal(
+        &self,
+        basin: BasinName,
+    ) -> Result<BasinConfig, GetBasinConfigError> {
         let Some(meta) = self
             .db_get(kv::basin_meta::ser_key(&basin), kv::basin_meta::deser_value)
             .await?

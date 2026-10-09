@@ -556,3 +556,447 @@ async fn nonce_and_revocation_state_survive_database_reopen() {
     );
     backend.close().await.unwrap();
 }
+
+fn grant_with_check(
+    issuer: &ClientKey,
+    holder: &ClientKey,
+    audience: &str,
+    scope: &GrantScope,
+    check: &str,
+) -> Grant {
+    use biscuit_auth::{
+        Biscuit, PrivateKey, PublicKey,
+        builder::{Algorithm, BlockBuilder, bytes, fact, int},
+    };
+    let public = |key: &ClientPublicKey| {
+        PublicKey::from_bytes(
+            &bs58::decode(key.to_base58()).into_vec().unwrap(),
+            Algorithm::Secp256r1,
+        )
+        .unwrap()
+    };
+    let root = issue_grant(issuer, &holder.public_key(), audience, scope, 2_000_000_000).unwrap();
+    let token = Biscuit::from(&*root, public(&issuer.public_key())).unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({"version":2,"client":holder.public_key(),"audience":audience,"scope":scope,"expires":2_000_000_000i64,"parent":token.revocation_identifiers()[0]})).unwrap();
+    let block = BlockBuilder::new()
+        .fact(fact("pki_grant", &[int(1), bytes(&payload)]))
+        .unwrap()
+        .code(check)
+        .unwrap();
+    let key = PrivateKey::from_bytes(
+        &bs58::decode(holder.to_base58()).into_vec().unwrap(),
+        Algorithm::Secp256r1,
+    )
+    .unwrap();
+    let response = token
+        .third_party_request()
+        .unwrap()
+        .create_block(&key, block)
+        .unwrap();
+    let child = token
+        .append_third_party(public(&holder.public_key()), response)
+        .unwrap();
+    Grant::from_base64(
+        child.to_base64().unwrap().trim_end_matches('='),
+        issuer.public_key(),
+    )
+    .unwrap()
+}
+fn checked_app(
+    backend: &s2_lite::backend::Backend,
+    audience: &str,
+    scope: GrantScope,
+    check: &str,
+) -> (axum::Router, PkiCredentials) {
+    let issuer = ClientKey::generate();
+    let holder = ClientKey::generate();
+    let grant = grant_with_check(&issuer, &holder, audience, &scope, check);
+    let state = s2_lite::pki::PkiAuthState::new(
+        backend.clone(),
+        TrustedIssuers::new(vec![issuer.public_key()]),
+        audience.into(),
+    )
+    .unwrap();
+    (
+        s2_lite::handlers::router_with_pki(state).with_state(backend.clone()),
+        PkiCredentials::new(holder, grant).unwrap(),
+    )
+}
+fn record_request(
+    credentials: &PkiCredentials,
+    method: Method,
+    path: &str,
+    payload: Vec<u8>,
+    content_type: &str,
+    accept: Option<&str>,
+    streaming: bool,
+) -> Request<Body> {
+    let uri: Uri = format!("{}{path}", credentials.audience()).parse().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("s2-basin", "allowed1".parse().unwrap());
+    headers.insert("content-type", content_type.parse().unwrap());
+    if let Some(accept) = accept {
+        headers.insert("accept", accept.parse().unwrap());
+    }
+    sign_request(
+        credentials,
+        &method,
+        &uri,
+        &mut headers,
+        if streaming {
+            RequestBody::Streaming
+        } else {
+            RequestBody::Unary(&payload)
+        },
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .unwrap();
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::from(payload))
+        .unwrap();
+    *request.headers_mut() = headers;
+    request
+}
+async fn provision_events(backend: &s2_lite::backend::Backend, name: &str) {
+    backend
+        .provision_stream(
+            "allowed1".parse().unwrap(),
+            name.parse().unwrap(),
+            s2_common::config::OptionalStreamConfig::default(),
+            ProvisionMode::CreateOnly {
+                request_token: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn review_remote_http_streaming_reads_and_appends_are_rejected() {
+    let (_, backend, _) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    ))
+    .await;
+    provision_events(&backend, "events").await;
+    let (app, credentials) = checked_app(
+        &backend,
+        "http://remote.example",
+        GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::Read, Operation::Append],
+        ),
+        "check if true;",
+    );
+    for (method, content_type, accept, streaming) in [
+        (
+            Method::GET,
+            "application/json",
+            Some("text/event-stream"),
+            false,
+        ),
+        (Method::GET, "s2s/proto", None, false),
+        (Method::POST, "s2s/proto", None, true),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(record_request(
+                &credentials,
+                method,
+                "/v1/streams/events/records",
+                vec![],
+                content_type,
+                accept,
+                streaming,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    backend.close().await.unwrap();
+}
+#[tokio::test]
+async fn review_implicit_creation_requires_no_config_read_permission() {
+    use s2_common::{config::BasinReconfiguration, maybe::Maybe};
+    let (app, backend, credentials) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Append, Operation::Read, Operation::CreateStream],
+    ))
+    .await;
+    backend
+        .reconfigure_basin(
+            "allowed1".parse().unwrap(),
+            BasinReconfiguration {
+                create_stream_on_append: Maybe::Specified(true),
+                create_stream_on_read: Maybe::Specified(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(record_request(
+            &credentials,
+            Method::POST,
+            "/v1/streams/auto-append/records",
+            br#"{"records":[{"body":"cGF5bG9hZA=="}]}"#.to_vec(),
+            "application/json",
+            None,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let response = app
+        .oneshot(record_request(
+            &credentials,
+            Method::GET,
+            "/v1/streams/auto-read/records?count=1&wait=0",
+            vec![],
+            "application/json",
+            None,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    for name in ["auto-append", "auto-read"] {
+        assert!(
+            backend
+                .get_stream_config("allowed1".parse().unwrap(), name.parse().unwrap())
+                .await
+                .is_ok()
+        );
+    }
+    backend.close().await.unwrap();
+}
+async fn denied_command_does_not_create(streaming: bool, fence: bool) {
+    use prost::Message;
+    use s2_api::v1::stream::{
+        proto,
+        s2s::{CompressionAlgorithm, SessionMessage},
+    };
+    use s2_common::{config::BasinReconfiguration, maybe::Maybe};
+    use s2_sdk::types as sdk;
+    let (app, backend, credentials) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![
+            Operation::Append,
+            Operation::CreateStream,
+            Operation::GetBasinConfig,
+        ],
+    ))
+    .await;
+    backend
+        .reconfigure_basin(
+            "allowed1".parse().unwrap(),
+            BasinReconfiguration {
+                create_stream_on_append: Maybe::Specified(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let command = if fence {
+        sdk::CommandRecord::fence("new-fence".parse().unwrap())
+    } else {
+        sdk::CommandRecord::trim(42)
+    };
+    let input: proto::AppendInput = sdk::AppendInput::new(
+        sdk::AppendRecordBatch::try_from_iter([
+            sdk::AppendRecord::new("payload").unwrap(),
+            command.into(),
+        ])
+        .unwrap(),
+    )
+    .into();
+    let payload = if streaming {
+        SessionMessage::regular(CompressionAlgorithm::None, &input)
+            .unwrap()
+            .encode()
+            .to_vec()
+    } else {
+        input.encode_to_vec()
+    };
+    let response = app
+        .oneshot(record_request(
+            &credentials,
+            Method::POST,
+            "/v1/streams/denied-command/records",
+            payload,
+            if streaming {
+                "s2s/proto"
+            } else {
+                "application/protobuf"
+            },
+            None,
+            streaming,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        if streaming {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    );
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(!bytes.is_empty());
+    assert!(
+        backend
+            .get_stream_config(
+                "allowed1".parse().unwrap(),
+                "denied-command".parse().unwrap()
+            )
+            .await
+            .is_err(),
+        "a rejected first batch must not create the stream"
+    );
+    backend.close().await.unwrap();
+}
+#[tokio::test]
+async fn review_unary_trim_denial_has_no_creation_effect() {
+    denied_command_does_not_create(false, false).await
+}
+#[tokio::test]
+async fn review_unary_fence_denial_has_no_creation_effect() {
+    denied_command_does_not_create(false, true).await
+}
+#[tokio::test]
+async fn review_streaming_trim_denial_has_no_creation_effect() {
+    denied_command_does_not_create(true, false).await
+}
+#[tokio::test]
+async fn review_streaming_fence_denial_has_no_creation_effect() {
+    denied_command_does_not_create(true, true).await
+}
+#[tokio::test]
+async fn review_biscuit_resource_checks_filter_lists_before_pagination() {
+    let (_, backend, _) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::ListBasins],
+    ))
+    .await;
+    let (app, credentials) = checked_app(
+        &backend,
+        "http://localhost",
+        GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::ListBasins],
+        ),
+        "check if basin(\"allowed1\");",
+    );
+    let response = app
+        .oneshot(signed(&credentials, Method::GET, "/v1/basins?limit=1", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(json["basins"][0]["name"], "allowed1");
+    assert_eq!(json["basins"].as_array().unwrap().len(), 1);
+    assert_eq!(json["has_more"], false);
+    provision_events(&backend, "events").await;
+    provision_events(&backend, "hidden").await;
+    for (check, expected) in [
+        ("check if stream(\"events\");", 1),
+        ("check if stream(\"absent\");", 0),
+    ] {
+        let (app, credentials) = checked_app(
+            &backend,
+            "http://localhost",
+            GrantScope::new(
+                ResourceScope::Any,
+                ResourceScope::Any,
+                vec![Operation::ListStreams],
+            ),
+            check,
+        );
+        let response = app
+            .oneshot(record_request(
+                &credentials,
+                Method::GET,
+                "/v1/streams?limit=1",
+                vec![],
+                "application/json",
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(json["streams"].as_array().unwrap().len(), expected);
+        assert_eq!(json["has_more"], false);
+        if expected == 1 {
+            assert_eq!(json["streams"][0]["name"], "events");
+        }
+    }
+    backend.close().await.unwrap();
+}
+#[tokio::test]
+async fn review_idle_read_enforces_a_biscuit_time_check() {
+    use futures::StreamExt;
+    let (_, backend, _) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    ))
+    .await;
+    provision_events(&backend, "events").await;
+    let deadline = time::OffsetDateTime::now_utc().unix_timestamp() + 3;
+    let (app, credentials) = checked_app(
+        &backend,
+        "http://localhost",
+        GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::Read],
+        ),
+        &format!("check if time($t), $t < {deadline};"),
+    );
+    let response = app
+        .oneshot(record_request(
+            &credentials,
+            Method::GET,
+            "/v1/streams/events/records?seq_num=0",
+            vec![],
+            "application/json",
+            Some("text/event-stream"),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(item) = body.next().await {
+            if item.is_err() {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(ended, Ok(true)),
+        "read must stop at its Biscuit check deadline, before structured expiry"
+    );
+    drop(body);
+    backend.close().await.unwrap();
+}

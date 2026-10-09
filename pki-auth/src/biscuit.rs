@@ -321,6 +321,25 @@ pub fn delegate_grant(
     )?;
     Ok(grant)
 }
+/// Check a collection's operation grant and expiry without evaluating checks that need
+/// candidate resource facts. Call `authorize_operation` on every candidate before disclosing it.
+pub fn authorize_collection(
+    capability: &VerifiedCapability,
+    operation: Operation,
+    basin: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let target_valid = match operation {
+        Operation::ListBasins => basin.is_none(),
+        Operation::ListStreams => basin.is_some_and(|b| capability.scope().basins.contains(b)),
+        _ => false,
+    };
+    if !target_valid || now >= capability.expires_at() || !capability.scope().permits(operation) {
+        return Err(AuthError::PermissionDenied);
+    }
+    Ok(())
+}
+
 pub fn authorize_operation(
     capability: &VerifiedCapability,
     operation: Operation,

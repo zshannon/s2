@@ -65,6 +65,18 @@ impl VerifiedRequest {
     pub fn lease_expires_at(&self) -> i64 {
         self.lease_expires
     }
+    /// Preflight a list operation; complete policy evaluation belongs to each candidate row.
+    pub fn authorize_collection(
+        &self,
+        operation: Operation,
+        basin: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        if now >= self.lease_expires {
+            return Err(AuthError::PermissionDenied);
+        }
+        authorize_collection(&self.capability, operation, basin, now)
+    }
     pub fn authorize(
         &self,
         op: s2_common::access::Operation,
@@ -76,6 +88,17 @@ impl VerifiedRequest {
             return Err(AuthError::PermissionDenied);
         }
         authorize_operation(&self.capability, op, basin, stream, now)
+    }
+}
+/// Signed stream openings require HTTPS; HTTP is allowed only for loopback development.
+pub fn validate_streaming_transport(uri: &Uri) -> Result<()> {
+    if uri.scheme_str() == Some("https")
+        || (uri.scheme_str() == Some("http")
+            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
+    {
+        Ok(())
+    } else {
+        Err(AuthError::Audience)
     }
 }
 fn sigerr(_: impl std::fmt::Display) -> AuthError {

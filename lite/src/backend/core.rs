@@ -381,7 +381,7 @@ impl Backend {
         let client = match self.streamer_client_guarded(basin, stream).await {
             Ok(client) => client,
             Err(StreamerError::StreamNotFound(e)) => {
-                let config = match self.get_basin_config(basin.clone()).await {
+                let config = match self.basin_config_internal(basin.clone()).await {
                     Ok(config) => config,
                     Err(GetBasinConfigError::Storage(e)) => Err(e)?,
                     Err(GetBasinConfigError::BasinNotFound(e)) => Err(e)?,

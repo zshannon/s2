@@ -19,6 +19,19 @@ use super::{Backend, StreamHandle, core::AutoCreateOn};
 use crate::backend::error::{AppendError, AppendErrorInternal, StorageError};
 
 impl Backend {
+    pub(crate) async fn authorize_append_batch(
+        &self,
+        basin: &BasinName,
+        stream: &StreamName,
+        input: &AppendInput,
+    ) -> Result<(), AppendError> {
+        let pki = self
+            .pki
+            .clone()
+            .map(|identity| (identity, basin.clone(), stream.clone()));
+        check_append(&self.db, pki.as_ref(), input).await
+    }
+
     /// Open a stream for an append or append session.
     ///
     /// `stream_config` is applied if the stream is created on append. Unset fields inherit the

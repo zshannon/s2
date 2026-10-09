@@ -27,6 +27,10 @@ additionally verifies the leaf client's HTTP proof and returns a
 verified capability without a database. All Biscuit checks also execute against
 trusted request facts (`time` as Unix seconds, `operation` as its Rust variant
 name, and decoded `basin`/`stream` strings). Fact construction uses typed values.
+For listings, `authorize_collection` checks the operation, structured scope and
+expiry first; the host must then call `authorize_operation` with each candidate's
+resource facts before exposing it or counting it toward pagination. A resource
+check can therefore produce an empty allowed result without blocking the list.
 The host must consume the nonce atomically and check every revocation identifier
 before accepting a request. Neither of those state checks can grant permissions.
 
@@ -53,8 +57,15 @@ external host, path, query, and signed headers. Cleartext streaming is limited
 to loopback development. This profile does not authenticate individual frames
 through an untrusted TLS terminator. Sessions last at most five minutes or the
 grant expiry, whichever comes first, and Lite rechecks revocation and expiry
-at least once a second, including idle sessions. Every append batch checks
-Append and any Trim/Fence commands before submission. SDK retries and reconnects
+at least once a second, including idle sessions. Reads also re-evaluate all
+Biscuit checks against the current time and effective basin/stream before
+releasing data. Both SDK and Lite reject remote cleartext read and append
+sessions. Every append batch checks
+Append and any Trim/Fence commands before submission. PKI append sessions defer
+implicit creation until the first batch passes those checks; rejected unary or
+first streaming batches leave the resource absent. Automatic creation requires
+CreateStream alongside the data operation, with no extra GetBasinConfig grant.
+SDK retries and reconnects
 sign fresh proofs; append uncertainty monitoring remains active.
 
 Lite stores nonce and revocation state in SlateDB using reserved prefixes

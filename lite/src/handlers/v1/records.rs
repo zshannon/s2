@@ -192,9 +192,13 @@ pub async fn read(
         request,
     }: ReadArgs,
 ) -> Result<Response, ServiceError> {
+    let policy = crate::pki::ReadPolicy {
+        basin: basin.as_ref().to_owned(),
+        stream: stream.as_ref().to_owned(),
+    };
     let backend = auth.scope(backend);
     let start: ReadStart = start.try_into()?;
-    match request {
+    let result = match request {
         v1t::stream::ReadRequest::Unary {
             encryption_key,
             create_stream_config_patch,
@@ -305,7 +309,11 @@ pub async fn read(
                 .body(Body::from_stream(response_stream))
                 .expect("valid response builder"))
         }
-    }
+    };
+    result.map(|mut response: Response| {
+        response.extensions_mut().insert(policy);
+        response
+    })
 }
 
 async fn merge_read_session(
@@ -397,6 +405,12 @@ pub async fn append(
         request,
     }: AppendArgs,
 ) -> Result<Response, ServiceError> {
+    auth.authorize(
+        s2_pki_auth::Operation::Append,
+        Some(basin.as_ref()),
+        Some(stream.as_ref()),
+    )?;
+    let pki = auth.0.is_some();
     let backend = auth.scope(backend);
     match request {
         v1t::stream::AppendRequest::Unary {
@@ -405,6 +419,9 @@ pub async fn append(
             input,
             response_mime,
         } => {
+            backend
+                .authorize_append_batch(&basin, &stream, &input)
+                .await?;
             let handle = backend
                 .open_for_append(&basin, &stream, encryption_key, create_stream_config_patch)
                 .await?;
@@ -426,9 +443,20 @@ pub async fn append(
             inputs,
             response_compression,
         } => {
-            let handle = backend
-                .open_for_append(&basin, &stream, encryption_key, create_stream_config_patch)
-                .await?;
+            let handle = if pki {
+                None
+            } else {
+                Some(
+                    backend
+                        .open_for_append(
+                            &basin,
+                            &stream,
+                            encryption_key.clone(),
+                            create_stream_config_patch.clone(),
+                        )
+                        .await?,
+                )
+            };
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
             let inputs = async_stream::stream! {
@@ -447,10 +475,20 @@ pub async fn append(
                 }
             };
 
-            let ack_stream = handle.append_session(inputs).map(|res| {
-                res.map(v1t::stream::proto::AppendAck::from)
-                    .map_err(ServiceError::from)
-            });
+            let ack_stream = async_stream::try_stream! {
+                tokio::pin!(inputs);
+                if let Some(first) = inputs.next().await {
+                    backend.authorize_append_batch(&basin, &stream, &first).await.map_err(ServiceError::from)?;
+                    let handle = match handle {
+                        Some(handle) => handle,
+                        None => backend.open_for_append(&basin, &stream, encryption_key, create_stream_config_patch).await.map_err(ServiceError::from)?,
+                    };
+                    let inputs = futures::stream::once(async move { first }).chain(inputs);
+                    let acks = handle.append_session(inputs);
+                    tokio::pin!(acks);
+                    while let Some(ack) = acks.next().await { yield ack.map_err(ServiceError::from)?; }
+                }
+            }.map(|res: Result<s2_common::stream::AppendAck, ServiceError>| res.map(v1t::stream::proto::AppendAck::from));
 
             let input_err_stream = futures::stream::once(err_rx).filter_map(|res| async move {
                 match res {
