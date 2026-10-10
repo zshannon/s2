@@ -576,6 +576,7 @@ pub fn verify_biscuit(
     if biscuit.block_count() > MAX_GRANT_BLOCKS {
         return Err(AuthError::InvalidGrant);
     }
+    crate::policy::validate_serialized_policy(encoded)?;
     let blocks = literal_blocks(&biscuit)?;
     crate::policy::validate_policy_budget(&blocks)?;
     let mut current = read_block(&blocks[0], 0)?;

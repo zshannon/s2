@@ -821,3 +821,13 @@ fn full_length_native_delegation_chain_fits_the_resource_budget() {
     )
     .unwrap();
 }
+
+#[test]
+fn resource_budget_rejects_excess_preconversion_items() {
+    // Each literal remains individually small and the fact count stays below
+    // 512, but expanding all its references exceeds the aggregate raw budget.
+    let source = (0..450)
+        .map(|i| format!("item({i}, \"x\", \"x\", \"x\", \"x\", \"x\", \"x\", \"x\");"))
+        .collect::<String>();
+    assert_policy_rejected(&source);
+}

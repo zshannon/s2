@@ -71,7 +71,13 @@ additionally verifies the leaf client's HTTP proof and returns a
 verified capability using Biscuit's authorizer, without a database or a parallel
 Rust permission evaluator. Additional Biscuit checks run alongside the required
 native checks, under a conservative admission budget enforced by the shared
-crate before any policy evaluation. There are at most 512 literal facts across
+crate before any policy evaluation. An initial pass reads authenticated interned
+blocks before constructing an authorizer or expanding symbol references. It
+bounds symbols to 1024 bytes, rejects rules/collections/closures, and caps 4096
+aggregate conversion items (predicate names/terms, query/check entries,
+expression steps/values, and scopes). Raw queries have at most two predicates
+and 16 expression operations; the subsequent native AST guard admits those
+joins only for the exact mandatory checks. There are at most 512 literal facts across
 the token, 64 custom queries, and 4096 aggregate custom work units. Each custom
 query has at most one body predicate and 16 expression operations; its work
 charge is `(literal facts + 7 ambient facts) * (1 + predicate arity + expression
