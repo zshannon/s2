@@ -13,6 +13,7 @@ ARG S2_GIT_REV=unknown
 # Use Docker BuildKit cache mounts for faster builds
 RUN --mount=type=bind,source=api,target=/build/api \
     --mount=type=bind,source=common,target=/build/common \
+    --mount=type=bind,source=pki-auth,target=/build/pki-auth \
     --mount=type=bind,source=lite,target=/build/lite \
     --mount=type=bind,source=resource-spec,target=/build/resource-spec \
     --mount=type=bind,source=sdk,target=/build/sdk \
