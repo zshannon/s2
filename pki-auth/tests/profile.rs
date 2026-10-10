@@ -612,3 +612,212 @@ fn prefix_scoped_custom_checks_remain_supported() {
         .is_err()
     );
 }
+
+fn budgeted_child(source: &str) -> (Vec<u8>, TrustedIssuers) {
+    let issuer = ClientKey::generate();
+    let holder = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let parent = issue_grant(
+        &issuer,
+        &holder.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let child = external_block(
+        &parent,
+        &holder,
+        &holder.public_key(),
+        &scope,
+        1_999_999_000,
+        Some(source),
+    );
+    (child, TrustedIssuers::new(vec![issuer.public_key()]))
+}
+fn assert_policy_rejected(source: &str) {
+    let (child, trusted) = budgeted_child(source);
+    assert!(
+        matches!(
+            verify_biscuit(&child, &trusted, "http://localhost"),
+            Err(AuthError::InvalidGrant)
+        ),
+        "unbounded custom policy must be rejected before native evaluation"
+    );
+}
+#[test]
+fn resource_budget_rejects_custom_fact_generation() {
+    assert_policy_rejected(
+        "item(0); item(1); pair($a, $b) <- item($a), item($b); check if pair(0, 1);",
+    );
+}
+#[test]
+fn resource_budget_rejects_custom_query_cartesian_products() {
+    assert_policy_rejected("item(0); item(1); check if item($a), item($b), $a > $b;");
+}
+#[test]
+fn resource_budget_rejects_expanding_string_expressions() {
+    assert_policy_rejected("check if stream($s), ($s + $s).length() > 0;");
+}
+#[test]
+fn resource_budget_rejects_custom_regex_evaluation() {
+    assert_policy_rejected("check if stream($s), $s.matches(\"^events$\");");
+}
+#[test]
+fn resource_budget_rejects_excess_literal_facts() {
+    let facts = (0..520).map(|i| format!("item({i});")).collect::<String>();
+    assert_policy_rejected(&facts);
+}
+#[test]
+fn resource_budget_rejects_excess_custom_queries() {
+    assert_policy_rejected(&"check if operation(\"Read\");".repeat(65));
+}
+#[test]
+fn resource_budget_rejects_excess_linear_query_work() {
+    let mut source = (0..200).map(|i| format!("item({i});")).collect::<String>();
+    source.push_str(&"check if item($v), $v >= 0;".repeat(16));
+    assert_policy_rejected(&source);
+}
+#[test]
+fn bounded_custom_native_checks_preserve_resource_and_time_restrictions() {
+    let (child, trusted) = budgeted_child(
+        "item(\"events/\"); check all item($v), $v == \"events/\"; check if stream($s), $s.starts_with(\"events/\"); check if time($t), $t < 1950000000; reject if operation(\"Append\");",
+    );
+    let capability = verify_biscuit(&child, &trusted, "http://localhost").unwrap();
+    authorize_operation(
+        &capability,
+        Operation::Read,
+        Some("logs"),
+        Some("events/one"),
+        1_900_000_000,
+    )
+    .unwrap();
+    for (operation, stream, now) in [
+        (Operation::Read, "private/one", 1_900_000_000),
+        (Operation::Read, "events/one", 1_950_000_000),
+        (Operation::Append, "events/one", 1_900_000_000),
+    ] {
+        assert!(
+            authorize_operation(&capability, operation, Some("logs"), Some(stream), now).is_err()
+        );
+    }
+}
+#[test]
+fn resource_budget_rejects_collection_values() {
+    assert_policy_rejected("item([1, 2]); check if true;");
+}
+#[test]
+fn resource_budget_rejects_large_scalar_values() {
+    assert_policy_rejected(&format!("item(\"{}\");", "x".repeat(1025)));
+}
+#[test]
+fn resource_budget_rejects_wide_predicates() {
+    assert_policy_rejected("item(0, 1, 2, 3, 4, 5, 6, 7, 8);");
+}
+#[test]
+fn resource_budget_rejects_duplicate_native_checks() {
+    assert_policy_rejected("check if operation($op), pki_operation(1, $op) trusting authority;");
+}
+#[test]
+fn resource_budget_rejects_empty_custom_checks() {
+    use biscuit_auth::builder::{Check, CheckKind};
+    let issuer = ClientKey::generate();
+    let holder = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let parent = issue_grant(
+        &issuer,
+        &holder.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let child = external_block_custom(
+        &parent,
+        &holder,
+        &holder.public_key(),
+        &scope,
+        1_999_999_000,
+        |block| {
+            block
+                .check(Check {
+                    queries: vec![],
+                    kind: CheckKind::One,
+                })
+                .unwrap()
+        },
+    );
+    assert!(matches!(
+        verify_biscuit(
+            &child,
+            &TrustedIssuers::new(vec![issuer.public_key()]),
+            "http://localhost"
+        ),
+        Err(AuthError::InvalidGrant)
+    ));
+}
+#[test]
+fn full_length_native_delegation_chain_fits_the_resource_budget() {
+    let issuer = ClientKey::generate();
+    let holder = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![
+            Operation::ListBasins,
+            Operation::CreateBasin,
+            Operation::DeleteBasin,
+            Operation::ReconfigureBasin,
+            Operation::GetBasinConfig,
+            Operation::ListStreams,
+            Operation::CreateStream,
+            Operation::DeleteStream,
+            Operation::GetStreamConfig,
+            Operation::ReconfigureStream,
+            Operation::CheckTail,
+            Operation::Append,
+            Operation::Read,
+            Operation::Trim,
+            Operation::Fence,
+            Operation::AccountMetrics,
+            Operation::BasinMetrics,
+            Operation::StreamMetrics,
+            Operation::ListLocations,
+            Operation::GetDefaultLocation,
+            Operation::SetDefaultLocation,
+        ],
+    );
+    let mut grant = issue_grant(
+        &issuer,
+        &holder.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    for index in 1..MAX_GRANT_BLOCKS {
+        grant = restrict_grant(&grant, &holder, &scope, 2_000_000_000 - index as i64).unwrap();
+    }
+    let capability = verify_biscuit(
+        &grant,
+        &TrustedIssuers::new(vec![issuer.public_key()]),
+        "http://localhost",
+    )
+    .unwrap();
+    authorize_operation(
+        &capability,
+        Operation::Read,
+        Some("logs"),
+        Some("events"),
+        1_900_000_000,
+    )
+    .unwrap();
+}

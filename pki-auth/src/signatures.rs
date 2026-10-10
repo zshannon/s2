@@ -65,6 +65,14 @@ impl VerifiedRequest {
     pub fn lease_expires_at(&self) -> i64 {
         self.lease_expires
     }
+    /// Recheck at the final admission boundary after awaited replay-state work.
+    /// Already admitted sessions continue under their separate session lease.
+    pub fn validate_admission(&self, now: i64) -> Result<()> {
+        if now < 0 || now >= self.proof_expires || now >= self.lease_expires {
+            return Err(AuthError::Signature);
+        }
+        Ok(())
+    }
     /// Preflight a list operation; complete policy evaluation belongs to each candidate row.
     pub fn authorize_collection(
         &self,

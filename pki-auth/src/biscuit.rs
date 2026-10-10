@@ -200,7 +200,7 @@ fn ambient_predicate(name: &str) -> bool {
 // Explicit authority scopes prevent a block-level `trusting previous` or a
 // future block signed by the same holder from changing these checks' origins.
 // The current block and authorizer are always included by Biscuit.
-fn required_checks(index: usize) -> Result<BlockBuilder> {
+pub(super) fn required_checks(index: usize) -> Result<BlockBuilder> {
     let mut block = BlockBuilder::new().code(format!(
         r#"
         check if operation($op), pki_operation({index}, $op) trusting authority;
@@ -577,6 +577,7 @@ pub fn verify_biscuit(
         return Err(AuthError::InvalidGrant);
     }
     let blocks = literal_blocks(&biscuit)?;
+    crate::policy::validate_policy_budget(&blocks)?;
     let mut current = read_block(&blocks[0], 0)?;
     if current.parent.is_some() || (!audience.is_empty() && current.audience != audience) {
         return Err(AuthError::Audience);
@@ -729,6 +730,11 @@ fn request_context(
     stream: Option<&str>,
     now: i64,
 ) -> Result<AuthorizerBuilder> {
+    if basin.is_some_and(|value| value.len() > crate::policy::MAX_TERM_BYTES)
+        || stream.is_some_and(|value| value.len() > crate::policy::MAX_TERM_BYTES)
+    {
+        return Err(AuthError::PermissionDenied);
+    }
     let mut builder = AuthorizerBuilder::new()
         .set_limits(limits())
         .fact(fact("time", &[int(now)]))?

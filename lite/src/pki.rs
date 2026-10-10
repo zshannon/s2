@@ -199,6 +199,12 @@ pub(crate) async fn authenticate(
         Ok(false) => return error(ErrorCode::Authn),
         Err(_) => return error(ErrorCode::Unavailable),
     }
+    if identity
+        .validate_admission(time::OffsetDateTime::now_utc().unix_timestamp())
+        .is_err()
+    {
+        return error(ErrorCode::Authn);
+    }
     if original.path().starts_with("/v1/access-tokens") {
         return error(ErrorCode::PermissionDenied);
     }

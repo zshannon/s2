@@ -2,6 +2,7 @@
 //! Permission evaluation has no database dependency.
 mod biscuit;
 mod keys;
+mod policy;
 pub use biscuit::*;
 pub use keys::*;
 

@@ -70,8 +70,21 @@ additionally verifies the leaf client's HTTP proof and returns a
 `VerifiedRequest`. `authorize_operation` and `authorize_append` evaluate the
 verified capability using Biscuit's authorizer, without a database or a parallel
 Rust permission evaluator. Additional Biscuit checks run alongside the required
-native checks. Public-key trust scopes are rejected in every block's global
-scopes, rules, and check queries: Biscuit resolves such scopes across future
+native checks, under a conservative admission budget enforced by the shared
+crate before any policy evaluation. There are at most 512 literal facts across
+the token, 64 custom queries, and 4096 aggregate custom work units. Each custom
+query has at most one body predicate and 16 expression operations; its work
+charge is `(literal facts + 7 ambient facts) * (1 + predicate arity + expression
+operations)`, or one candidate for a predicate-free query. Scalars are bounded
+to 1024 bytes, names to 128 bytes, and predicates to eight terms. The five exact
+mandatory native checks occur once per block; their singleton/indexed joins
+have fixed cost. Custom rules/fact generation, multi-predicate custom joins,
+collections, closures, regex, and expanding operators are rejected. Scalar
+comparisons, booleans, length/type queries, and prefix/suffix checks remain
+native, including One/All/Reject checks and OR alternatives within the budget.
+Biscuit's 100 ms cooperative timeout is secondary; it is not relied on to
+interrupt a query or rule expansion. Public-key trust scopes are rejected in
+every block's global scopes, rules, and check queries: Biscuit resolves such scopes across future
 blocks, which could relax an ancestor's custom restriction. Custom checks may
 use the default authority/current origins or `trusting previous`; those origins
 are fixed to the signed prefix. Fact construction uses typed values, so resource
@@ -86,7 +99,13 @@ audience, and known-basin checks first; the host must then call
 resource facts before exposing it or counting it toward pagination. A resource
 check can therefore produce an empty allowed result without blocking the list.
 The host must consume the nonce atomically and check every revocation identifier
-before accepting a request. Neither of those state checks can grant permissions.
+before accepting a request. `VerifiedRequest::validate_admission` must pass
+both before replay-state work and after durable nonce consumption, immediately
+before invoking a handler. A proof that expires during awaited work is denied;
+an already admitted session continues under its separate lease. Nonce cleanup
+reads the current nonce expiry in its serializable deletion transaction and
+only removes a value matching the expired index, preserving replacements and
+skipping conflicting cleanup transactions. Neither state check grants permissions.
 
 Revocation is `POST /v1/pki/revocations` with `{"grant":"<Biscuit base64url>"}`.
 Only the issuer or a holder in that grant's ancestry may revoke it. The target's
