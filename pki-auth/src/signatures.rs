@@ -134,6 +134,21 @@ fn origin(uri: &Uri) -> Result<String> {
         uri.authority().ok_or(AuthError::Audience)?
     ))
 }
+/// Validate an exact HTTP(S) origin without rewriting its authority or default port.
+pub fn validate_audience(audience: &str) -> Result<()> {
+    let uri: Uri = audience.parse().map_err(|_| AuthError::Audience)?;
+    let scheme = uri.scheme_str().ok_or(AuthError::Audience)?;
+    let authority = uri.authority().ok_or(AuthError::Audience)?;
+    if !matches!(scheme, "http" | "https")
+        || audience != origin(&uri)?
+        || authority.host().is_empty()
+        || authority.as_str().contains('@')
+        || (authority.as_str() != authority.host() && authority.port_u16().is_none())
+    {
+        return Err(AuthError::Audience);
+    }
+    Ok(())
+}
 fn covered(headers: &HeaderMap) -> Vec<String> {
     let mut names: Vec<_> = headers
         .keys()

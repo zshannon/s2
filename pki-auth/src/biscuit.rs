@@ -623,7 +623,8 @@ pub fn issue_grant(
     expires: i64,
 ) -> Result<Grant> {
     client.verifying_key()?;
-    if audience.is_empty() || expires <= time::OffsetDateTime::now_utc().unix_timestamp() {
+    crate::validate_audience(audience)?;
+    if expires <= time::OffsetDateTime::now_utc().unix_timestamp() {
         return Err(AuthError::InvalidGrant);
     }
     let metadata = BlockMetadata {

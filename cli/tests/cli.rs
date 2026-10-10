@@ -696,6 +696,7 @@ async fn lite_environment_root_enables_exclusive_pki_authentication() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let audience = format!("http://127.0.0.1:{port}");
+    let startup_log = env.home.path().join("lite-startup.log");
     let mut process = LiteProcess(
         std::process::Command::new(assert_cmd::cargo::cargo_bin!("s2"))
             .args(["lite", "--port", &port.to_string()])
@@ -703,7 +704,8 @@ async fn lite_environment_root_enables_exclusive_pki_authentication() {
             .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
             .env("S2LITE_PKI_ISSUER", issuer.public_key().to_base58())
             .env("S2LITE_PKI_AUDIENCE", &audience)
-            .stdout(std::process::Stdio::null())
+            .env("RUST_LOG", "info")
+            .stdout(std::fs::File::create(&startup_log).unwrap())
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap(),
@@ -782,6 +784,147 @@ async fn lite_environment_root_enables_exclusive_pki_authentication() {
             expected
         );
     }
+    let startup = std::fs::read_to_string(startup_log).unwrap();
+    assert!(
+        !startup.contains("S2_ACCESS_TOKEN"),
+        "PKI startup must not recommend bearer credentials: {startup}"
+    );
+    assert!(
+        startup.contains("s2 auth pki set"),
+        "PKI startup should identify the credential setup command: {startup}"
+    );
+}
+
+fn pki_inputs(env: &TestEnv) -> (std::path::PathBuf, std::path::PathBuf) {
+    use s2_pki_auth::*;
+    let issuer = ClientKey::generate();
+    let key = ClientKey::generate();
+    let grant = issue_grant(
+        &issuer,
+        &key.public_key(),
+        "http://localhost",
+        &GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::ListBasins],
+        ),
+        2_000_000_000,
+    )
+    .unwrap();
+    let key_file = env.home.path().join("cleanup-client.key");
+    let grant_file = env.home.path().join("cleanup-grant.json");
+    std::fs::write(&key_file, key.to_base58()).unwrap();
+    std::fs::write(
+        &grant_file,
+        serde_json::json!({"issuer": issuer.public_key().to_base58(), "grant": grant.to_base64()})
+            .to_string(),
+    )
+    .unwrap();
+    (key_file, grant_file)
+}
+
+fn selected_pki(env: &TestEnv) -> (String, std::path::PathBuf) {
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap())
+            .unwrap();
+    let id = config["pki"]["credential_id"].as_str().unwrap().to_owned();
+    let file = std::fs::read_dir(env.config_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pki-")
+        })
+        .unwrap();
+    (id, file)
+}
+
+#[test]
+fn pki_remove_retains_failed_cleanup_for_retry() {
+    let env = TestEnv::new();
+    let (key, grant) = pki_inputs(&env);
+    env.s2()
+        .args([
+            "auth",
+            "pki",
+            "set",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--grant-file",
+            grant.to_str().unwrap(),
+            "--insecure-storage",
+        ])
+        .assert()
+        .success();
+    let (id, file) = selected_pki(&env);
+    let saved = file.with_extension("saved");
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().failure();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    assert!(
+        config.contains(&id),
+        "failed deletion must retain its cleanup ID: {config}"
+    );
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert!(
+        parsed.get("pki").is_none(),
+        "credential must be deactivated before cleanup"
+    );
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&saved, &file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().success();
+    assert!(!file.exists(), "retry must erase the original credential");
+    assert!(
+        !std::fs::read_to_string(env.config_dir().join("config.toml"))
+            .unwrap()
+            .contains(&id)
+    );
+}
+
+#[test]
+fn pki_replacement_retains_failed_old_cleanup_for_retry() {
+    let env = TestEnv::new();
+    let (key, grant) = pki_inputs(&env);
+    let args = [
+        "auth",
+        "pki",
+        "set",
+        "--key-file",
+        key.to_str().unwrap(),
+        "--grant-file",
+        grant.to_str().unwrap(),
+        "--insecure-storage",
+    ];
+    env.s2().args(args).assert().success();
+    let (id, file) = selected_pki(&env);
+    let saved = file.with_extension("saved");
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    env.s2().args(args).assert().failure();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_ne!(parsed["pki"]["credential_id"].as_str().unwrap(), id);
+    assert!(
+        config.contains(&id),
+        "replacement must retain the old cleanup ID: {config}"
+    );
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&saved, &file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().success();
+    assert!(!file.exists(), "retry must erase the old credential");
+    assert!(
+        !std::fs::read_dir(env.config_dir())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pki-")),
+        "removal must erase both credentials"
+    );
 }
 
 #[test]

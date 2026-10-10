@@ -50,6 +50,8 @@ impl From<Compression> for sdk::types::Compression {
 #[serde(default)]
 pub struct CliConfig {
     pub pki: Option<StoredCredentialReference>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_pki_cleanup: Vec<StoredCredentialReference>,
     /// Legacy plaintext access token. New writes use `stored_access_token`.
     pub access_token: Option<String>,
     pub stored_access_token: Option<StoredCredentialReference>,

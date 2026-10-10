@@ -146,13 +146,45 @@ pub fn validate_destination(
 ) -> Result<(), String> {
     let (account, basin) = crate::login::effective_endpoints(config);
     for endpoint in [account, basin] {
-        let uri: reqwest::Url = endpoint.parse().map_err(|_| "Invalid PKI endpoint")?;
-        if uri.origin().ascii_serialization() != credentials.audience() {
+        validate_audience(&endpoint).map_err(|_| "Invalid PKI endpoint")?;
+        if endpoint != credentials.audience() {
             return Err("PKI credential audience does not match the configured endpoints".into());
         }
     }
     Ok(())
 }
+
+fn queue_cleanup(config: &mut CliConfig, reference: &StoredCredentialReference) {
+    if !config.pending_pki_cleanup.contains(reference) {
+        config.pending_pki_cleanup.push(reference.clone());
+    }
+}
+
+fn cleanup_pending_credentials(config: &mut CliConfig) -> Result<(), CliError> {
+    let mut error = None;
+    config.pending_pki_cleanup.retain(|reference| {
+        match credential_store::delete(
+            CredentialKind::Pki,
+            &reference.credential_id,
+            reference.credential_store,
+        ) {
+            Ok(()) => false,
+            Err(e) => {
+                error.get_or_insert(e);
+                true
+            }
+        }
+    });
+    // Failed deletions remain durable; successful deletions are idempotent on retry.
+    config::save_cli_config(config)?;
+    match error {
+        Some(e) => Err(err(format!(
+            "PKI cleanup incomplete; retry `s2 auth pki remove`: {e}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
     match command {
         PkiCommand::Keygen {
@@ -245,38 +277,44 @@ pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
             let _lock = config::acquire_config_lock().await?;
             let mut config = config::load_config_file()?;
             let previous = config.pki.clone();
-            let id = uuid::Uuid::new_v4().to_string();
             let store = if *insecure_storage {
                 CredentialStore::File
             } else {
                 CredentialStore::Keyring
             };
+            // Reuse an inactive slot rather than growing the journal on failed writes.
+            let reference = config
+                .pending_pki_cleanup
+                .iter()
+                .find(|reference| reference.credential_store == store)
+                .cloned()
+                .unwrap_or_else(|| StoredCredentialReference {
+                    credential_id: uuid::Uuid::new_v4().to_string(),
+                    credential_store: store,
+                });
             let bytes = serde_json::to_vec(&Bundle {
                 key: key.to_base58(),
                 issuer: grant.issuer().clone(),
                 grant: grant.to_base64(),
             })
             .map_err(err)?;
-            credential_store::save(CredentialKind::Pki, &id, store, &bytes).map_err(err)?;
-            config.pki = Some(StoredCredentialReference {
-                credential_id: id.clone(),
-                credential_store: store,
-            });
+            // Journal before writing the secret so interrupted writes retain a cleanup path.
+            queue_cleanup(&mut config, &reference);
+            config::save_cli_config(&config)?;
+            credential_store::save(CredentialKind::Pki, &reference.credential_id, store, &bytes)
+                .map_err(err)?;
+            config
+                .pending_pki_cleanup
+                .retain(|pending| pending != &reference);
+            config.pki = Some(reference);
             config.auth_method = Some(AuthMethod::Pki);
             config.account_endpoint = Some(credentials.audience().into());
             config.basin_endpoint = Some(credentials.audience().into());
-            if let Err(e) = config::save_cli_config(&config) {
-                let _ = credential_store::delete(CredentialKind::Pki, &id, store);
-                return Err(e.into());
-            }
             if let Some(previous) = previous {
-                credential_store::delete(
-                    CredentialKind::Pki,
-                    &previous.credential_id,
-                    previous.credential_store,
-                )
-                .map_err(err)?
+                queue_cleanup(&mut config, &previous);
             }
+            config::save_cli_config(&config)?;
+            cleanup_pending_credentials(&mut config)?;
             eprintln!("PKI credentials saved and selected");
         }
         PkiCommand::Remove => {
@@ -286,15 +324,11 @@ pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
             if config.auth_method == Some(AuthMethod::Pki) {
                 config.auth_method = None
             }
-            config::save_cli_config(&config)?;
             if let Some(previous) = previous {
-                credential_store::delete(
-                    CredentialKind::Pki,
-                    &previous.credential_id,
-                    previous.credential_store,
-                )
-                .map_err(err)?
+                queue_cleanup(&mut config, &previous);
             }
+            config::save_cli_config(&config)?;
+            cleanup_pending_credentials(&mut config)?;
         }
         PkiCommand::Revoke { grant_file } => {
             let target = grant(grant_file)?;
@@ -311,4 +345,47 @@ pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destination_validation_preserves_explicit_default_ports() {
+        let issuer = ClientKey::generate();
+        let key = ClientKey::generate();
+        for audience in [
+            "http://localhost:80",
+            "https://example.test:443",
+            "http://[::1]:80",
+        ] {
+            let grant = issue_grant(
+                &issuer,
+                &key.public_key(),
+                audience,
+                &GrantScope::new(
+                    ResourceScope::Any,
+                    ResourceScope::Any,
+                    vec![Operation::ListBasins],
+                ),
+                2_000_000_000,
+            )
+            .unwrap();
+            let credentials = PkiCredentials::new(key.clone(), grant).unwrap();
+            let mut config = CliConfig {
+                account_endpoint: Some(audience.into()),
+                basin_endpoint: Some(audience.into()),
+                ..Default::default()
+            };
+            assert!(
+                validate_destination(&credentials, &config).is_ok(),
+                "valid audience: {audience}"
+            );
+            config.basin_endpoint = Some("http://another.test:80".into());
+            assert!(validate_destination(&credentials, &config).is_err());
+            config.basin_endpoint = Some(format!("{audience}/path"));
+            assert!(validate_destination(&credentials, &config).is_err());
+        }
+    }
 }

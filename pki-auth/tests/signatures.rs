@@ -1,6 +1,105 @@
 use http::{HeaderMap, HeaderValue, Method, Uri};
 use s2_common::access::Operation;
 use s2_pki_auth::*;
+
+#[test]
+fn issuance_rejects_non_origin_audiences() {
+    let issuer = ClientKey::generate();
+    let client = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    for audience in [
+        "https://host/",
+        "https://host/path",
+        "https://host?query=1",
+        "https://host#fragment",
+        "arbitrary-string",
+        "ftp://host",
+        "https://user@host",
+        "https://host:",
+        "https://host:abc",
+        "https://host:65536",
+        "https://:443",
+        "",
+    ] {
+        assert!(
+            issue_grant(
+                &issuer,
+                &client.public_key(),
+                audience,
+                &scope,
+                2_000_000_000
+            )
+            .is_err(),
+            "must reject non-origin audience: {audience}"
+        );
+    }
+}
+
+#[test]
+fn explicit_ports_survive_issuance_signing_and_verification() {
+    let issuer = ClientKey::generate();
+    let client = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    for audience in [
+        "http://localhost:80",
+        "https://example.test:443",
+        "http://[::1]:80",
+        "http://[::1]",
+        "https://example.test:8443",
+    ] {
+        let grant = issue_grant(
+            &issuer,
+            &client.public_key(),
+            audience,
+            &scope,
+            2_000_000_000,
+        )
+        .unwrap();
+        let credentials = PkiCredentials::new(client.clone(), grant).unwrap();
+        let uri: Uri = format!("{audience}/v1/basins").parse().unwrap();
+        let mut headers = HeaderMap::new();
+        sign_request(
+            &credentials,
+            &Method::GET,
+            &uri,
+            &mut headers,
+            RequestBody::Unary(b""),
+            now,
+        )
+        .unwrap();
+        verify_request(
+            &TrustedIssuers::new(vec![issuer.public_key()]),
+            audience,
+            &Method::GET,
+            &uri,
+            &headers,
+            RequestBody::Unary(b""),
+            now,
+        )
+        .unwrap();
+        assert!(
+            sign_request(
+                &credentials,
+                &Method::GET,
+                &"http://another.test/v1/basins".parse().unwrap(),
+                &mut HeaderMap::new(),
+                RequestBody::Unary(b""),
+                now
+            )
+            .is_err()
+        );
+    }
+}
+
 fn credentials() -> (PkiCredentials, TrustedIssuers) {
     let issuer = ClientKey::generate();
     let client = ClientKey::generate();

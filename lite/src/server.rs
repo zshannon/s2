@@ -141,7 +141,7 @@ impl LiteArgs {
                     .map(|key| s2_pki_auth::ClientPublicKey::from_base58(key))
                     .collect::<s2_pki_auth::Result<Vec<_>>>()
                     .wrap_err("Invalid PKI configuration")?;
-                crate::pki::validate_audience(audience).wrap_err("Invalid PKI configuration")?;
+                s2_pki_auth::validate_audience(audience).wrap_err("Invalid PKI configuration")?;
                 Ok(Some((
                     s2_pki_auth::TrustedIssuers::new(issuers),
                     audience.clone(),
@@ -234,7 +234,11 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
     let protocol = ServerProtocol::from_args(&args);
     let port = args.port.unwrap_or_else(|| protocol.default_port());
     let addr = format!("0.0.0.0:{port}");
-    let cli_hint = cli_env_hint(protocol, port);
+    let cli_hint = if pki_config.is_some() {
+        "PKI authentication enabled; configure the CLI with s2 auth pki set --key-file <client-key> --grant-file <grant>".to_owned()
+    } else {
+        cli_env_hint(protocol, port)
+    };
 
     let store_type = if let Some(bucket) = args.bucket {
         StoreType::S3Bucket(bucket)

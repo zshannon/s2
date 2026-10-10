@@ -10,7 +10,9 @@ use axum::{
 use futures::StreamExt;
 use http::{Uri, request::Parts};
 use s2_api::v1::error::{ErrorCode, ErrorInfo, ErrorResponse, StandardError};
-use s2_pki_auth::{RequestBody, TrustedIssuers, VerifiedRequest, verify_request};
+use s2_pki_auth::{
+    RequestBody, TrustedIssuers, VerifiedRequest, validate_audience, verify_request,
+};
 
 use crate::backend::Backend;
 #[derive(Clone)]
@@ -44,20 +46,6 @@ impl PkiAuthState {
                 .unwrap_or(false)
     }
 }
-pub(crate) fn validate_audience(audience: &str) -> s2_pki_auth::Result<()> {
-    let uri: Uri = audience
-        .parse()
-        .map_err(|_| s2_pki_auth::AuthError::Audience)?;
-    let scheme = uri.scheme_str().ok_or(s2_pki_auth::AuthError::Audience)?;
-    let authority = uri.authority().ok_or(s2_pki_auth::AuthError::Audience)?;
-    // Request proofs compare against exactly scheme://authority. Keep the
-    // original spelling so an accepted configuration can match that identity.
-    if !matches!(scheme, "http" | "https") || audience != format!("{scheme}://{authority}") {
-        return Err(s2_pki_auth::AuthError::Audience);
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 pub(crate) struct ReadPolicy {
     pub basin: String,
