@@ -831,3 +831,72 @@ fn resource_budget_rejects_excess_preconversion_items() {
         .collect::<String>();
     assert_policy_rejected(&source);
 }
+
+#[test]
+fn collection_preflight_rejects_all_broad_custom_check_kinds() {
+    let issuer = ClientKey::generate();
+    let holder = ClientKey::generate();
+    let trusted = TrustedIssuers::new(vec![issuer.public_key()]);
+    for operation in [Operation::ListBasins, Operation::ListStreams] {
+        for resource in [
+            ResourceScope::Any,
+            ResourceScope::Prefix("allowed".into()),
+            ResourceScope::Exact("allowed1".into()),
+            ResourceScope::None,
+        ] {
+            let broad = matches!(resource, ResourceScope::Any | ResourceScope::Prefix(_));
+            let scope = if operation == Operation::ListBasins {
+                GrantScope::new(resource, ResourceScope::Any, vec![operation])
+            } else {
+                GrantScope::new(ResourceScope::Any, resource, vec![operation])
+            };
+            let root = issue_grant(
+                &issuer,
+                &holder.public_key(),
+                "http://localhost",
+                &scope,
+                2_000_000_000,
+            )
+            .unwrap();
+            for check in [
+                "check if false;",
+                "check if true;",
+                "check all time($t), $t > 0;",
+                "reject if operation(\"Read\");",
+            ] {
+                let child = external_block(
+                    &root,
+                    &holder,
+                    &holder.public_key(),
+                    &scope,
+                    1_999_999_000,
+                    Some(check),
+                );
+                let capability = verify_biscuit(&child, &trusted, "http://localhost").unwrap();
+                let basin = (operation == Operation::ListStreams).then_some("allowed1");
+                let result = authorize_collection(&capability, operation, basin, 1_900_000_000);
+                if broad {
+                    assert!(
+                        matches!(result, Err(AuthError::PermissionDenied)),
+                        "all additional native check kinds must fail broad preflight"
+                    );
+                } else {
+                    result.unwrap();
+                    if check == "check if false;" {
+                        assert!(
+                            authorize_operation(
+                                &capability,
+                                operation,
+                                Some("allowed1"),
+                                (operation == Operation::ListStreams).then_some("allowed1"),
+                                1_900_000_000,
+                            )
+                            .is_err(),
+                            "retaining exact preflight must not bypass a native custom denial"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

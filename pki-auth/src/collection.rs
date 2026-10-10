@@ -4,8 +4,9 @@ use crate::{AuthError, Operation, ResourceScope, Result, VerifiedRequest};
 pub const MAX_COLLECTION_CANDIDATES: usize = 4096;
 
 /// One budget per list request, including denied rows and pagination lookahead.
-/// Hosts must stop on errors and discard partial output; never expose a raw
-/// scanned-key cursor or derive `has_more` from denied candidates.
+/// Hosts must intersect scans with `resource_scope`, stop on errors and discard
+/// partial output; never expose a raw scanned-key cursor or derive `has_more`
+/// from denied candidates. Broad custom policies are rejected at preflight.
 pub struct CollectionAuthorizer<'a> {
     request: &'a VerifiedRequest,
     operation: Operation,
@@ -38,7 +39,7 @@ impl VerifiedRequest {
     }
 }
 impl CollectionAuthorizer<'_> {
-    /// Scan optimization only. All cumulative native checks still run per row.
+    /// Hosts must honor these scan bounds. All native checks still run per row.
     pub fn resource_scope(&self) -> &ResourceScope {
         let scope = self.request.capability().scope();
         match self.operation {

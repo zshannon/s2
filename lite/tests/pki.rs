@@ -882,7 +882,7 @@ async fn review_streaming_fence_denial_has_no_creation_effect() {
     denied_command_does_not_create(true, true).await
 }
 #[tokio::test]
-async fn review_biscuit_resource_checks_filter_lists_before_pagination() {
+async fn review_exact_biscuit_resource_checks_filter_lists_before_pagination() {
     let (_, backend, _) = setup(GrantScope::new(
         ResourceScope::Any,
         ResourceScope::Any,
@@ -893,7 +893,7 @@ async fn review_biscuit_resource_checks_filter_lists_before_pagination() {
         &backend,
         "http://localhost",
         GrantScope::new(
-            ResourceScope::Any,
+            ResourceScope::Exact("allowed1".into()),
             ResourceScope::Any,
             vec![Operation::ListBasins],
         ),
@@ -921,7 +921,7 @@ async fn review_biscuit_resource_checks_filter_lists_before_pagination() {
             "http://localhost",
             GrantScope::new(
                 ResourceScope::Any,
-                ResourceScope::Any,
+                ResourceScope::Exact("events".into()),
                 vec![Operation::ListStreams],
             ),
             check,
@@ -1122,4 +1122,51 @@ async fn ensure_stream_checks_the_actual_create_or_reconfigure_outcome() {
         }
         backend.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn review_broad_custom_lists_are_denied_without_page_or_cursor() {
+    let (_, backend, _) = setup(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::ListBasins],
+    ))
+    .await;
+    provision_events(&backend, "events").await;
+    for streams in [false, true] {
+        for resource in [ResourceScope::Any, ResourceScope::Prefix("allowed".into())] {
+            let scope = if streams {
+                GrantScope::new(ResourceScope::Any, resource, vec![Operation::ListStreams])
+            } else {
+                GrantScope::new(resource, ResourceScope::Any, vec![Operation::ListBasins])
+            };
+            let (app, credentials) =
+                checked_app(&backend, "http://localhost", scope, "check if false;");
+            let request = if streams {
+                record_request(
+                    &credentials,
+                    Method::GET,
+                    "/v1/streams?limit=1",
+                    vec![],
+                    "application/json",
+                    None,
+                    false,
+                )
+            } else {
+                signed(&credentials, Method::GET, "/v1/basins?limit=1", "")
+            };
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let json: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "code": "permission_denied", "message": "Permission denied"
+                })
+            );
+        }
+    }
+    backend.close().await.unwrap();
 }

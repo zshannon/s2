@@ -69,6 +69,14 @@ fn delegated_list_identity(
     scope: GrantScope,
     check: &str,
 ) -> VerifiedRequest {
+    list_identity_with_custom_ancestor(parent_scope, scope, check, false)
+}
+fn list_identity_with_custom_ancestor(
+    parent_scope: GrantScope,
+    scope: GrantScope,
+    check: &str,
+    custom_in_ancestor: bool,
+) -> VerifiedRequest {
     use biscuit_auth::{
         Biscuit, PrivateKey, PublicKey,
         builder::{Algorithm, BlockBuilder},
@@ -116,6 +124,11 @@ fn delegated_list_identity(
         issuer.public_key(),
     )
     .unwrap();
+    let grant = if custom_in_ancestor {
+        restrict_grant(&grant, &holder, &scope, 2_000_000_000).unwrap()
+    } else {
+        grant
+    };
     let credentials = PkiCredentials::new(holder, grant).unwrap();
     let uri = "http://localhost/v1/basins".parse().unwrap();
     let mut headers = HeaderMap::new();
@@ -194,22 +207,8 @@ async fn list_fixture(hidden: usize, allowed: &[&str]) -> Backend {
     backend
 }
 
-async fn assert_generic_list_error(error: crate::handlers::v1::error::ServiceError) {
-    use axum::{body::to_bytes, response::IntoResponse};
-    let response = error.into_response();
-    assert!(!response.status().is_success());
-    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["message"], "Listing work limit exceeded");
-    assert_eq!(
-        json.as_object().unwrap().len(),
-        2,
-        "only generic code/message; no partial page, denied names, counts or cursor"
-    );
-}
-
 #[tokio::test]
-async fn list_basins_work_budget_bounds_all_denied_candidates() {
+async fn list_basins_broad_custom_policy_is_denied() {
     let backend = list_fixture(4097, &[]).await;
     let scoped = backend.clone().with_pki(Some(list_identity(
         GrantScope::new(
@@ -225,13 +224,13 @@ async fn list_basins_work_budget_bounds_all_denied_candidates() {
             ..Default::default()
         })
         .await
-        .expect_err("all-denied scans must have a work bound");
-    assert_generic_list_error(error.into()).await;
+        .expect_err("broad custom policy must be rejected before scanning");
+    assert_generic_policy_error(error.into()).await;
     backend.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn list_streams_work_budget_bounds_all_denied_candidates() {
+async fn list_streams_broad_custom_policy_is_denied() {
     let backend = list_fixture(4097, &[]).await;
     let scoped = backend.clone().with_pki(Some(list_identity(
         GrantScope::new(
@@ -250,8 +249,8 @@ async fn list_streams_work_budget_bounds_all_denied_candidates() {
             },
         )
         .await
-        .expect_err("all-denied scans must have a work bound");
-    assert_generic_list_error(error.into()).await;
+        .expect_err("broad custom policy must be rejected before scanning");
+    assert_generic_policy_error(error.into()).await;
     backend.close().await.unwrap();
 }
 
@@ -307,7 +306,7 @@ fn list_scope(streams: bool, resource: ResourceScope) -> GrantScope {
     }
 }
 #[tokio::test]
-async fn list_work_budget_discards_allowed_partial_pages() {
+async fn list_unsupported_custom_policy_never_returns_allowed_partial_pages() {
     let backend = list_fixture(4097, &["allowed1"]).await;
     for streams in [false, true] {
         let check = if streams {
@@ -341,7 +340,7 @@ async fn list_work_budget_discards_allowed_partial_pages() {
                 .unwrap_err()
                 .into()
         };
-        assert_generic_list_error(error).await;
+        assert_generic_policy_error(error).await;
     }
     backend.close().await.unwrap();
 }
@@ -469,7 +468,7 @@ async fn list_delegated_scope_is_optimized_but_custom_checks_still_apply() {
     backend.close().await.unwrap();
 }
 #[tokio::test]
-async fn list_custom_checks_keep_sparse_pages_and_authorized_lookahead() {
+async fn list_broad_custom_policy_is_rejected_at_every_page_boundary() {
     let backend = list_fixture(8, &[]).await;
     for streams in [false, true] {
         let resource = if streams { "stream" } else { "basin" };
@@ -480,23 +479,22 @@ async fn list_custom_checks_keep_sparse_pages_and_authorized_lookahead() {
             list_scope(streams, ResourceScope::Any),
             &check,
         )));
-        assert_eq!(
-            list_names(&scoped, streams, "", "", 2).await,
-            (vec!["hidden-000001".into(), "hidden-000003".into()], true)
-        );
-        assert_eq!(
-            list_names(&scoped, streams, "", "hidden-000003", 2).await,
-            (vec!["hidden-000005".into()], false)
-        );
-        assert_eq!(
-            list_names(&scoped, streams, "", "hidden-000005", 2).await,
-            (vec![], false)
-        );
+        for (prefix, after, limit) in [
+            ("", "", 2),
+            ("hidden", "hidden-000003", 2),
+            ("hidden", "hidden-000005", 1),
+            ("absent", "hidden-999999", 1000),
+        ] {
+            assert_generic_policy_error(
+                list_error_with_request(&scoped, streams, prefix, after, limit).await,
+            )
+            .await;
+        }
     }
     backend.close().await.unwrap();
 }
 #[tokio::test]
-async fn list_exactly_fitting_denied_scan_ends_without_false_more() {
+async fn list_exact_and_none_custom_denials_return_empty_without_false_more() {
     let backend = list_fixture(4096, &[]).await;
     for streams in [false, true] {
         let check = if streams {
@@ -504,14 +502,18 @@ async fn list_exactly_fitting_denied_scan_ends_without_false_more() {
         } else {
             "check if basin(\"absent01\");"
         };
-        let scoped = backend.clone().with_pki(Some(list_identity(
-            list_scope(streams, ResourceScope::Any),
-            check,
-        )));
-        assert_eq!(
-            list_names(&scoped, streams, "", "", 1).await,
-            (vec![], false)
-        );
+        for resource in [
+            ResourceScope::Exact("hidden-000001".into()),
+            ResourceScope::None,
+        ] {
+            let scoped = backend
+                .clone()
+                .with_pki(Some(list_identity(list_scope(streams, resource), check)));
+            assert_eq!(
+                list_names(&scoped, streams, "", "", 1).await,
+                (vec![], false)
+            );
+        }
     }
     backend.close().await.unwrap();
 }
@@ -692,4 +694,142 @@ async fn fresh_nonce_admission_is_once_only() {
             .unwrap()
     );
     backend.close().await.unwrap();
+}
+
+// A generic work error is still an oracle if one denied row changes success
+// into failure. The policy outcome must be fixed before reading any rows.
+async fn custom_policy_error(
+    backend: &Backend,
+    streams: bool,
+) -> crate::handlers::v1::error::ServiceError {
+    list_error_with_request(backend, streams, "", "", 1).await
+}
+async fn list_error_with_request(
+    backend: &Backend,
+    streams: bool,
+    prefix: &str,
+    start_after: &str,
+    limit: usize,
+) -> crate::handlers::v1::error::ServiceError {
+    if streams {
+        backend
+            .list_streams(
+                "allowed1".parse().unwrap(),
+                s2_common::stream::ListStreamsRequest {
+                    prefix: prefix.parse().unwrap(),
+                    start_after: start_after.parse().unwrap(),
+                    limit: limit.into(),
+                },
+            )
+            .await
+            .expect_err("unsupported broad custom policy must be denied before scanning")
+            .into()
+    } else {
+        backend
+            .list_basins(s2_common::basin::ListBasinsRequest {
+                prefix: prefix.parse().unwrap(),
+                start_after: start_after.parse().unwrap(),
+                limit: limit.into(),
+            })
+            .await
+            .expect_err("unsupported broad custom policy must be denied before scanning")
+            .into()
+    }
+}
+async fn assert_generic_policy_error(error: crate::handlers::v1::error::ServiceError) {
+    use axum::{body::to_bytes, response::IntoResponse};
+    let response = error.into_response();
+    assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "code": "permission_denied", "message": "Permission denied"
+        })
+    );
+}
+#[tokio::test]
+async fn list_custom_policy_rejection_does_not_depend_on_denied_rows() {
+    for rows in [4096, 4097, 0] {
+        let backend = list_fixture(rows, &[]).await;
+        for streams in [false, true] {
+            for resource in [ResourceScope::Any, ResourceScope::Prefix("hidden".into())] {
+                let scope = list_scope(streams, resource);
+                let predicate = if streams { "stream" } else { "basin" };
+                let resource_check = format!("check if {predicate}(\"absent01\");");
+                for check in ["check if false;", resource_check.as_str()] {
+                    for ancestor in [false, true] {
+                        let scoped =
+                            backend
+                                .clone()
+                                .with_pki(Some(list_identity_with_custom_ancestor(
+                                    scope.clone(),
+                                    scope.clone(),
+                                    check,
+                                    ancestor,
+                                )));
+                        assert_generic_policy_error(custom_policy_error(&scoped, streams).await)
+                            .await;
+                    }
+                }
+            }
+        }
+        backend.close().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn list_broad_custom_policy_rejected_before_storage_reads() {
+    let backend = backend().await;
+    backend.close().await.unwrap();
+    for streams in [false, true] {
+        for resource in [ResourceScope::Any, ResourceScope::Prefix("hidden".into())] {
+            let scope = list_scope(streams, resource);
+            for ancestor in [false, true] {
+                let identity = list_identity_with_custom_ancestor(
+                    scope.clone(),
+                    scope.clone(),
+                    "check if false;",
+                    ancestor,
+                );
+                let (operation, basin) = if streams {
+                    (Operation::ListStreams, Some("allowed1"))
+                } else {
+                    (Operation::ListBasins, None)
+                };
+                assert!(
+                    matches!(
+                        s2_pki_auth::authorize_collection(
+                            identity.capability(),
+                            operation,
+                            basin,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                        ),
+                        Err(AuthError::PermissionDenied)
+                    ),
+                    "bare shared preflight must enforce the same policy guard"
+                );
+                let scoped = backend.clone().with_pki(Some(identity));
+                assert_generic_policy_error(custom_policy_error(&scoped, streams).await).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_work_limit_error_is_generic_and_non_successful() {
+    use axum::{body::to_bytes, response::IntoResponse};
+    let error = StorageError::from(AuthError::ListWorkLimit);
+    let error: crate::handlers::v1::error::ServiceError =
+        super::super::error::ListBasinsError::from(error).into();
+    let response = error.into_response();
+    assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "code": "invalid", "message": "Listing work limit exceeded"
+        })
+    );
 }

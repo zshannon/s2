@@ -692,8 +692,10 @@ pub fn delegate_grant(
     )?;
     Ok(grant)
 }
-/// Evaluate native operation, expiry and known basin checks without checks that need
-/// candidate resource facts. Call `authorize_operation` on every candidate before disclosing it.
+/// Preflight native operation, expiry and known basin checks. Broad Any/Prefix
+/// listings reject custom checks in any block before storage access. Exact/None
+/// custom checks need candidate facts; honor the literal scan bounds and call
+/// `authorize_operation` on every candidate before disclosing it.
 pub fn authorize_collection(
     capability: &VerifiedCapability,
     operation: Operation,
@@ -706,9 +708,32 @@ pub fn authorize_collection(
     ) {
         return Err(AuthError::PermissionDenied);
     }
-    // Collection preflight evaluates the signed profile facts and native checks.
-    // Additional arbitrary checks need each candidate's resource context and are
-    // evaluated by authorize_operation before any row or count is disclosed.
+    let resource_scope = match operation {
+        Operation::ListBasins => &capability.scope().basins,
+        Operation::ListStreams => &capability.scope().streams,
+        _ => unreachable!("collection operation was validated above"),
+    };
+    if matches!(
+        resource_scope,
+        ResourceScope::Any | ResourceScope::Prefix(_)
+    ) {
+        // A budget error after filtering a broad custom policy reveals denied
+        // cardinality. Reject solely from the authenticated policy, before the
+        // host reads storage. Inspect every ancestor, even with a canonical leaf.
+        for (index, block) in capability.blocks.iter().enumerate() {
+            let required = required_checks(index)?;
+            if block
+                .checks
+                .iter()
+                .any(|check| !required.checks.contains(check))
+            {
+                return Err(AuthError::PermissionDenied);
+            }
+        }
+    }
+    // Exact/None scopes can retain arbitrary admitted native checks: a correctly
+    // intersected scan has at most one candidate, so cannot exhaust its budget.
+    // Every candidate still needs full cumulative native authorization.
     let mut builder = request_context(capability, operation, basin, None, now)?;
     for (index, block) in capability.blocks.iter().enumerate() {
         for f in block

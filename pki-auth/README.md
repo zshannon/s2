@@ -110,18 +110,31 @@ alternatives). The work ceiling permits at least 1001 worst-profile evaluations,
 so a fully authorized maximum page plus lookahead fits. These are structural
 bounds, not CPU-time or allocation measurements.
 
+Broad listings (literal Any/Prefix) support only the mandatory native profile
+checks in every authenticated block. Any additional custom check, including
+one in an ancestor, causes shared preflight to deny the listing before storage
+access. Lite returns generic `permission_denied` (HTTP 403) regardless of stored
+rows or the request's prefix/start-after. This is a deliberate policy restriction:
+filtering a broad custom policy until a work limit would make success versus
+failure reveal denied-resource existence. A narrower request prefix cannot
+relax this guard. Exact/None literal scopes retain admitted custom checks;
+full cumulative native authorization can filter the single exact candidate.
+Broad custom-filtered listing needs an authorization-aware query/index plan
+before it can be supported safely.
+
 Lite intersects the request prefix/start-after range with the verified leaf
-literal Exact/Prefix/None scope, as an optimization; every output still requires
-full native authorization. An exact scope excludes extension names. Custom
-checks can produce empty or sparse allowed pages when the scan fits its budget.
+literal Exact/Prefix/None scope before scanning. An exact scope excludes
+extension names. Embedding hosts must likewise honor these scope bounds; scope
+selection never replaces full native authorization. Standard broad listings
+preserve maximum pages, ordering, start-after and authorized-only lookahead.
 Expiry aborts a scan rather than filtering its remaining rows. On exhaustion,
 Lite returns `invalid` (HTTP 422) with a generic message and discards the whole
 partial page. It never returns denied names/counts, a scanned-key cursor, or a
-`has_more` inferred from denied candidates. Narrow the request prefix to bound a
-large sparse scan; no new continuation format is introduced. Embedding hosts
-must likewise stop on budget/expiry errors, discard partial output and check
-`check_active` before completing a scan. Bare `authorize_collection` preflight
-alone does not bound a subsequent scan.
+`has_more` inferred from denied candidates. No new continuation format is
+introduced. Embedding hosts must stop on budget/expiry errors, discard partial
+output and check `check_active` before completing a scan. Bare
+`authorize_collection` enforces the same policy guard but does not itself bound
+subsequent scan work.
 The host must consume the nonce atomically and check every revocation identifier
 before accepting a request. `VerifiedRequest::validate_admission` must pass
 both before replay-state work and after durable nonce consumption, immediately
