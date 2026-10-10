@@ -119,6 +119,8 @@ impl TestEnv {
             "S2_BASIN_ENDPOINT",
             "S2_COMPRESSION",
             "S2_SSL_NO_VERIFY",
+            "S2LITE_PKI_ISSUER",
+            "S2LITE_PKI_AUDIENCE",
         ] {
             cmd.env_remove(key);
         }
@@ -645,6 +647,10 @@ fn pki_credentials_replace_environment_bearer_tokens_and_keep_keys_out_of_config
     )
     .unwrap();
     env.s2()
+        .args(["config", "set", "ssl_no_verify", "true"])
+        .assert()
+        .success();
+    env.s2()
         .args([
             "auth",
             "pki",
@@ -660,6 +666,7 @@ fn pki_credentials_replace_environment_bearer_tokens_and_keep_keys_out_of_config
     let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
     assert!(!config.contains(&client.to_base58()));
     assert!(config.contains("pki"));
+    assert!(config.contains("ssl_no_verify = true"));
     env.s2()
         .args(["list-basins"])
         .env("S2_ACCESS_TOKEN", "invalid-bearer-must-be-ignored")
@@ -669,4 +676,155 @@ fn pki_credentials_replace_environment_bearer_tokens_and_keep_keys_out_of_config
     assert!(observed.contains("authorization: Biscuit "));
     assert!(observed.contains("signature-input: s2="));
     assert!(!observed.contains("invalid-bearer"));
+}
+
+struct LiteProcess(std::process::Child);
+impl Drop for LiteProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn lite_environment_root_enables_exclusive_pki_authentication() {
+    use s2_pki_auth::*;
+    let env = TestEnv::new();
+    let issuer = ClientKey::generate();
+    let key = ClientKey::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let audience = format!("http://127.0.0.1:{port}");
+    let mut process = LiteProcess(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("s2"))
+            .args(["lite", "--port", &port.to_string()])
+            .env("HOME", env.home.path())
+            .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
+            .env("S2LITE_PKI_ISSUER", issuer.public_key().to_base58())
+            .env("S2LITE_PKI_AUDIENCE", &audience)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let target = format!("{audience}/v1/basins");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = client.get(&target).send().await {
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "root ENV configuration must activate PKI"
+            );
+            break;
+        }
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "Lite exited before serving"
+        );
+        assert!(tokio::time::Instant::now() < deadline, "Lite did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        client
+            .get(&target)
+            .bearer_auth("untrusted-bearer")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    for (root, expected) in [
+        (issuer, reqwest::StatusCode::OK),
+        (ClientKey::generate(), reqwest::StatusCode::UNAUTHORIZED),
+    ] {
+        let grant = issue_grant(
+            &root,
+            &key.public_key(),
+            &audience,
+            &GrantScope::new(
+                ResourceScope::Any,
+                ResourceScope::Any,
+                vec![Operation::ListBasins],
+            ),
+            2_000_000_000,
+        )
+        .unwrap();
+        let credentials = PkiCredentials::new(key.clone(), grant).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ACCEPT, "*/*".parse().unwrap());
+        sign_request(
+            &credentials,
+            &reqwest::Method::GET,
+            &target.parse().unwrap(),
+            &mut headers,
+            RequestBody::Unary(b""),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .get(&target)
+                .headers(headers)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn lite_incomplete_environment_pki_configuration_fails_startup() {
+    let env = TestEnv::new();
+    let root = s2_pki_auth::ClientKey::generate()
+        .public_key()
+        .to_base58()
+        .to_owned();
+    for (name, value, required) in [
+        ("S2LITE_PKI_ISSUER", root.as_str(), "--pki-audience"),
+        ("S2LITE_PKI_AUDIENCE", "http://example.test", "--pki-issuer"),
+    ] {
+        env.s2()
+            .args(["lite", "--port", "0"])
+            .env(name, value)
+            .timeout(Duration::from_secs(2))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(required));
+    }
+}
+
+#[test]
+fn lite_invalid_environment_root_fails_startup() {
+    let env = TestEnv::new();
+    let root = s2_pki_auth::ClientKey::generate()
+        .public_key()
+        .to_base58()
+        .to_owned();
+    for (issuer, audience) in [
+        ("invalid-key", "http://example.test"),
+        ("", "http://example.test"),
+        ("", ""),
+        (root.as_str(), "invalid-origin"),
+    ] {
+        env.s2()
+            .args(["lite", "--port", "0"])
+            .env("S2LITE_PKI_ISSUER", issuer)
+            .env("S2LITE_PKI_AUDIENCE", audience)
+            .timeout(Duration::from_secs(2))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("PKI"));
+    }
 }

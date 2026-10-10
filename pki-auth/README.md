@@ -70,8 +70,16 @@ additionally verifies the leaf client's HTTP proof and returns a
 `VerifiedRequest`. `authorize_operation` and `authorize_append` evaluate the
 verified capability using Biscuit's authorizer, without a database or a parallel
 Rust permission evaluator. Additional Biscuit checks run alongside the required
-native checks. Fact construction uses typed values, so resource names are never
-interpolated into Datalog source.
+native checks. Public-key trust scopes are rejected in every block's global
+scopes, rules, and check queries: Biscuit resolves such scopes across future
+blocks, which could relax an ancestor's custom restriction. Custom checks may
+use the default authority/current origins or `trusting previous`; those origins
+are fixed to the signed prefix. Fact construction uses typed values, so resource
+names are never interpolated into Datalog source.
+Stream provisioning performs a shared-crate preflight before reading metadata.
+An ensure requires at least one of CreateStream/ReconfigureStream initially,
+then the actual operation is checked after determining existence. Forbidden
+requests cannot disclose whether the basin is absent, present, or deleting.
 For listings, `authorize_collection` evaluates native operation, expiry,
 audience, and known-basin checks first; the host must then call
 `authorize_operation` with each candidate's
@@ -101,16 +109,12 @@ and expiry within 60 seconds. Unary requests always include a SHA-256
 Content-Digest, even for an empty body, calculated after compression. Lite
 verifies bytes before decompression and does not trust forwarded origin headers.
 
-Streaming requests sign their opening and rely on authenticated TLS for frames.
-Use TLS directly or a trusted TLS terminator that preserves the original
-external host, path, query, and signed headers. Cleartext streaming is limited
-to loopback development. This profile does not authenticate individual frames
-through an untrusted TLS terminator. Sessions last at most five minutes or the
+Streaming requests sign their opening; individual frames are not covered by
+that HTTP signature. Sessions last at most five minutes or the
 grant expiry, whichever comes first, and Lite rechecks revocation and expiry
 at least once a second, including idle sessions. Reads also re-evaluate all
 Biscuit checks against the current time and effective basin/stream before
-releasing data. Both SDK and Lite reject remote cleartext read and append
-sessions. Every append batch checks
+releasing data. Every append batch checks
 Append and any Trim/Fence commands before submission. PKI append sessions defer
 implicit creation until the first batch passes those checks; rejected unary or
 first streaming batches leave the resource absent. Automatic creation requires
@@ -173,9 +177,17 @@ s2 auth pki delegate --key-file alice.key --grant-file alice.grant.json \
   --expires-at 1999999000 --out bob.grant.json
 s2 auth pki inspect --grant-file bob.grant.json
 s2 auth pki revoke --grant-file bob.grant.json
-s2 lite --tls-cert cert.pem --tls-key key.pem \
-  --pki-issuer "$(cat issuer.pub)" --pki-audience https://streams.example.com
+S2LITE_PKI_ISSUER="$(cat issuer.pub)" \
+S2LITE_PKI_AUDIENCE=https://streams.example.com s2 lite
 ```
+
+Lite accepts the trusted root public key through `S2LITE_PKI_ISSUER` (or
+`--pki-issuer`), with optional comma-separated roots for rotation. Set the exact
+HTTP grant origin in `S2LITE_PKI_AUDIENCE` (or `--pki-audience`). Providing one
+without the other, an invalid root key, or an invalid origin fails startup
+before storage initialization. A complete pair activates exclusive PKI
+verification for the API; grant files and request headers cannot select trusted
+roots. The existing non-PKI mode is selected only when neither setting is present.
 
 `s2 auth pki inspect` includes each signed block's native source in
 `datalog_blocks`, alongside its verified delegation metadata. The `.grant.json`

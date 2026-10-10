@@ -857,14 +857,6 @@ impl BaseClient {
     where
         C: client::Connect + Clone + Send + Sync + 'static,
     {
-        if matches!(config.access_token, AccessToken::Pki(_))
-            && config.insecure_skip_cert_verification
-        {
-            return Err(ClientError::Configuration(
-                "PKI streaming requires verified TLS certificates".into(),
-            )
-            .into());
-        }
         let access_token_mode = config.access_token.mode();
         let mut default_headers = config.default_headers.clone();
         // Authorization belongs to the configured token, including when a
@@ -956,11 +948,6 @@ impl BaseClient {
         request: client::Request,
     ) -> Result<(StreamingResponse, Option<String>), ApiError> {
         let mut request = request;
-        if self.pki_credentials.is_some() {
-            request.validate_pki_streaming_transport().map_err(|_| {
-                ClientError::Configuration("PKI streaming requires HTTPS or loopback HTTP".into())
-            })?;
-        }
         let access_token = self.authorize(&mut request).await?;
         let response = self
             .client
@@ -1515,7 +1502,7 @@ mod tests {
 
     #[cfg(feature = "_hidden")]
     #[tokio::test]
-    async fn review_pki_streaming_requires_https_or_loopback_before_dispatch() {
+    async fn pki_streaming_authenticates_independently_of_transport_options() {
         use s2_pki_auth::*;
         for origin in [
             "http://remote.example",
@@ -1536,7 +1523,8 @@ mod tests {
                 2_000_000_000,
             )
             .unwrap();
-            let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap());
+            let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap())
+                .with_insecure_skip_cert_verification(true);
             let mut base = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
             let executor = Arc::new(HeaderCapture::default());
             base.client = executor.clone();
@@ -1560,38 +1548,28 @@ mod tests {
                 };
                 let _ = base.init_streaming_authorized(request).await;
             }
-            assert_eq!(
-                executor.streaming.lock().unwrap().len(),
-                if origin == "http://remote.example" {
-                    0
+            let requests = executor.streaming.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for (index, headers) in requests.iter().enumerate() {
+                let (method, body) = if index == 0 {
+                    (http::Method::GET, RequestBody::Unary(b""))
                 } else {
-                    2
-                }
-            );
+                    (http::Method::POST, RequestBody::Streaming)
+                };
+                verify_request(
+                    &TrustedIssuers::new(vec![issuer.public_key()]),
+                    origin,
+                    &method,
+                    &format!("{origin}/v1/streams/events/records")
+                        .parse()
+                        .unwrap(),
+                    headers,
+                    body,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .unwrap();
+            }
         }
-    }
-
-    #[cfg(feature = "_hidden")]
-    #[tokio::test]
-    async fn pki_rejects_disabled_tls_certificate_verification() {
-        use s2_pki_auth::*;
-        let issuer = ClientKey::generate();
-        let key = ClientKey::generate();
-        let grant = issue_grant(
-            &issuer,
-            &key.public_key(),
-            "https://streams.example.com",
-            &GrantScope::new(
-                ResourceScope::Any,
-                ResourceScope::Any,
-                vec![s2_common::access::Operation::Read],
-            ),
-            2_000_000_000,
-        )
-        .unwrap();
-        let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap())
-            .with_insecure_skip_cert_verification(true);
-        assert!(BaseClient::init_with_connector(&config, HttpConnector::new()).is_err());
     }
 
     #[cfg(feature = "_hidden")]

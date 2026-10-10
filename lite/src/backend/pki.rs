@@ -27,6 +27,24 @@ impl Backend {
         }
         Ok(())
     }
+    pub(super) fn authorize_provision_stream(
+        &self,
+        basin: &str,
+        stream: &str,
+        ensure: bool,
+    ) -> Result<(), StorageError> {
+        if let Some(identity) = &self.pki {
+            identity
+                .authorize_provision_stream(
+                    basin,
+                    stream,
+                    ensure,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .map_err(|_| StorageError::PermissionDenied)?;
+        }
+        Ok(())
+    }
     pub(super) fn authorize_collection(
         &self,
         operation: Operation,

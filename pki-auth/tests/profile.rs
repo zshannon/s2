@@ -108,6 +108,27 @@ fn external_block(
     expiry: i64,
     check: Option<&str>,
 ) -> Vec<u8> {
+    external_block_custom(
+        parent,
+        holder,
+        recipient,
+        scope,
+        expiry,
+        |block| match check {
+            Some(check) => block.code(check).unwrap(),
+            None => block,
+        },
+    )
+}
+
+fn external_block_custom(
+    parent: &Grant,
+    holder: &ClientKey,
+    recipient: &ClientPublicKey,
+    scope: &GrantScope,
+    expiry: i64,
+    customize: impl FnOnce(biscuit_auth::builder::BlockBuilder) -> biscuit_auth::builder::BlockBuilder,
+) -> Vec<u8> {
     use biscuit_auth::{
         Biscuit, PrivateKey, PublicKey,
         builder::{Algorithm, BlockBuilder, bytes, fact, int},
@@ -159,9 +180,7 @@ fn external_block(
             ],
         ))
         .unwrap();
-    if let Some(check) = check {
-        block = block.code(check).unwrap();
-    }
+    let block = customize(block);
     let key = PrivateKey::from_bytes(
         &bs58::decode(holder.to_base58()).into_vec().unwrap(),
         Algorithm::Secp256r1,
@@ -462,4 +481,134 @@ fn delegation_must_retain_every_native_profile_check() {
     let mut block = template;
     block.checks[0].queries[0].body[1].terms[0] = int(0);
     assert!(matches!(verify(block), Err(AuthError::InvalidGrant)));
+}
+
+fn reject_future_key_scope(kind: &str) {
+    use biscuit_auth::{
+        PublicKey,
+        builder::{Algorithm, Scope},
+    };
+    let issuer = ClientKey::generate();
+    let alice = ClientKey::generate();
+    let bob = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let parent = issue_grant(
+        &issuer,
+        &alice.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let public = PublicKey::from_bytes(
+        &bs58::decode(bob.public_key().to_base58())
+            .into_vec()
+            .unwrap(),
+        Algorithm::Secp256r1,
+    )
+    .unwrap();
+    let child = external_block_custom(
+        &parent,
+        &alice,
+        &bob.public_key(),
+        &scope,
+        1_999_999_000,
+        |block| match kind {
+            "check" => block
+                .code(format!(
+                    "check if operation(\"Append\") or override(true) trusting {public};"
+                ))
+                .unwrap(),
+            "global" => block
+                .scope(Scope::PublicKey(public))
+                .code("check if operation(\"Append\") or override(true);")
+                .unwrap(),
+            "rule" => block
+                .code(format!(
+                    "allowed($op) <- operation($op) trusting {public}; check if allowed(\"Read\");"
+                ))
+                .unwrap(),
+            _ => unreachable!(),
+        },
+    );
+    assert!(
+        matches!(
+            verify_biscuit(
+                &child,
+                &TrustedIssuers::new(vec![issuer.public_key()]),
+                "http://localhost"
+            ),
+            Err(AuthError::InvalidGrant)
+        ),
+        "future-resolving {kind} origins must be rejected by the shared profile"
+    );
+}
+
+#[test]
+fn custom_checks_cannot_trust_future_signer_blocks() {
+    reject_future_key_scope("check");
+}
+#[test]
+fn global_scopes_cannot_trust_future_signer_blocks() {
+    reject_future_key_scope("global");
+}
+#[test]
+fn custom_rules_cannot_trust_future_signer_blocks() {
+    reject_future_key_scope("rule");
+}
+
+#[test]
+fn prefix_scoped_custom_checks_remain_supported() {
+    let issuer = ClientKey::generate();
+    let alice = ClientKey::generate();
+    let bob = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let parent = issue_grant(
+        &issuer,
+        &alice.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let child = external_block(
+        &parent,
+        &alice,
+        &bob.public_key(),
+        &scope,
+        1_999_999_000,
+        Some("check if pki_operation(0, \"Read\") trusting previous;"),
+    );
+    let capability = verify_biscuit(
+        &child,
+        &TrustedIssuers::new(vec![issuer.public_key()]),
+        "http://localhost",
+    )
+    .unwrap();
+    authorize_operation(
+        &capability,
+        Operation::Read,
+        Some("logs"),
+        Some("events"),
+        1_900_000_000,
+    )
+    .unwrap();
+    assert!(
+        authorize_operation(
+            &capability,
+            Operation::Append,
+            Some("logs"),
+            Some("events"),
+            1_900_000_000
+        )
+        .is_err()
+    );
 }

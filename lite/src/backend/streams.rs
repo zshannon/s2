@@ -101,6 +101,11 @@ impl Backend {
         config: OptionalStreamConfig,
         mode: ProvisionMode,
     ) -> Result<ProvisionResult<StreamInfo>, ProvisionStreamError> {
+        self.authorize_provision_stream(
+            basin.as_ref(),
+            stream.as_ref(),
+            matches!(mode, ProvisionMode::Ensure),
+        )?;
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
         let Some(basin_meta) = db_txn_get(

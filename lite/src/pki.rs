@@ -26,15 +26,7 @@ impl PkiAuthState {
         issuers: TrustedIssuers,
         audience: String,
     ) -> s2_pki_auth::Result<Self> {
-        let uri: Uri = audience
-            .parse()
-            .map_err(|_| s2_pki_auth::AuthError::Audience)?;
-        if !matches!(uri.scheme_str(), Some("http" | "https"))
-            || uri.authority().is_none()
-            || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
-        {
-            return Err(s2_pki_auth::AuthError::Audience);
-        }
+        validate_audience(&audience)?;
         Ok(Self(Arc::new(Inner {
             backend,
             issuers,
@@ -52,6 +44,19 @@ impl PkiAuthState {
                 .unwrap_or(false)
     }
 }
+pub(crate) fn validate_audience(audience: &str) -> s2_pki_auth::Result<()> {
+    let uri: Uri = audience
+        .parse()
+        .map_err(|_| s2_pki_auth::AuthError::Audience)?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
+    {
+        return Err(s2_pki_auth::AuthError::Audience);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct ReadPolicy {
     pub basin: String,
@@ -145,19 +150,11 @@ pub(crate) async fn authenticate(
         return error(ErrorCode::Authn);
     }
     let content_type = s2_api::mime::content_type(request.headers());
-    let accept = s2_api::mime::accept(request.headers());
     let records = original.path().ends_with("/records");
     let proto = content_type
         .as_ref()
         .is_some_and(s2_api::mime::is_s2s_proto);
     let streaming = request.method() == http::Method::POST && records && proto;
-    let streaming_read = request.method() == http::Method::GET
-        && records
-        && (proto || accept.as_ref().is_some_and(s2_api::mime::is_event_stream));
-    if (streaming || streaming_read) && s2_pki_auth::validate_streaming_transport(&target).is_err()
-    {
-        return error(ErrorCode::Authn);
-    }
     let (parts, body) = request.into_parts();
     let (identity, body) = if streaming {
         match verify_request(

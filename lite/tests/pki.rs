@@ -674,7 +674,7 @@ async fn provision_events(backend: &s2_lite::backend::Backend, name: &str) {
         .unwrap();
 }
 #[tokio::test]
-async fn review_remote_http_streaming_reads_and_appends_are_rejected() {
+async fn pki_streaming_authentication_does_not_select_transport_policy() {
     let (_, backend, _) = setup(GrantScope::new(
         ResourceScope::Any,
         ResourceScope::Any,
@@ -715,7 +715,7 @@ async fn review_remote_http_streaming_reads_and_appends_are_rejected() {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
     backend.close().await.unwrap();
 }
@@ -1000,4 +1000,126 @@ async fn review_idle_read_enforces_a_biscuit_time_check() {
     );
     drop(body);
     backend.close().await.unwrap();
+}
+
+async fn forbidden_provisioning_hides_basin_state(scope: GrantScope) {
+    let (app, backend, credentials) = setup(scope).await;
+    backend
+        .provision_basin(
+            "deleted1".parse().unwrap(),
+            BasinConfig::default(),
+            ProvisionMode::Ensure,
+        )
+        .await
+        .unwrap();
+    backend
+        .delete_basin("deleted1".parse().unwrap())
+        .await
+        .unwrap();
+    for (method, path, body) in [
+        (Method::POST, "/v1/streams", "{\"stream\":\"events\"}"),
+        (Method::PUT, "/v1/streams/events", "{}"),
+    ] {
+        for basin in ["missing01", "hidden01", "deleted1"] {
+            let mut request = signed(&credentials, method.clone(), path, body);
+            request
+                .headers_mut()
+                .insert("s2-basin", basin.parse().unwrap());
+            sign_request(
+                &credentials,
+                &method,
+                &format!("http://localhost{path}").parse().unwrap(),
+                request.headers_mut(),
+                RequestBody::Unary(body.as_bytes()),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} must hide the state of {basin}"
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"code":"permission_denied", "message":"Permission denied"})
+            );
+        }
+    }
+    backend.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn provisioning_rejects_wrong_basin_scope_before_disclosing_metadata() {
+    forbidden_provisioning_hides_basin_state(GrantScope::new(
+        ResourceScope::Exact("allowed1".into()),
+        ResourceScope::Any,
+        vec![Operation::CreateStream, Operation::ReconfigureStream],
+    ))
+    .await;
+}
+#[tokio::test]
+async fn provisioning_rejects_missing_operations_before_disclosing_metadata() {
+    forbidden_provisioning_hides_basin_state(GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_stream_checks_the_actual_create_or_reconfigure_outcome() {
+    for (operation, existing, absent) in [
+        (
+            Operation::CreateStream,
+            StatusCode::FORBIDDEN,
+            StatusCode::CREATED,
+        ),
+        (
+            Operation::ReconfigureStream,
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (app, backend, credentials) = setup(GrantScope::new(
+            ResourceScope::Exact("allowed1".into()),
+            ResourceScope::Any,
+            vec![operation],
+        ))
+        .await;
+        provision_events(&backend, "events").await;
+        for (name, expected) in [("events", existing), ("new-events", absent)] {
+            let path = format!("/v1/streams/{name}");
+            let mut request = signed(&credentials, Method::PUT, &path, "{}");
+            request
+                .headers_mut()
+                .insert("s2-basin", "allowed1".parse().unwrap());
+            sign_request(
+                &credentials,
+                &Method::PUT,
+                &format!("http://localhost{path}").parse().unwrap(),
+                request.headers_mut(),
+                RequestBody::Unary(b"{}"),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        if operation == Operation::ReconfigureStream {
+            assert!(
+                backend
+                    .get_stream_config("allowed1".parse().unwrap(), "new-events".parse().unwrap())
+                    .await
+                    .is_err()
+            );
+        }
+        backend.close().await.unwrap();
+    }
 }

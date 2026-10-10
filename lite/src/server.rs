@@ -7,6 +7,7 @@ use std::{
 
 use axum_server::tls_rustls::RustlsConfig;
 use bytesize::ByteSize;
+use eyre::WrapErr;
 use http::header::AUTHORIZATION;
 use s2_common::encryption::S2_ENCRYPTION_KEY_HEADER;
 use slatedb::object_store;
@@ -40,10 +41,15 @@ pub struct TlsConfig {
 #[derive(clap::Args, Debug, Clone)]
 pub struct LiteArgs {
     /// Trusted base58 P-256 issuer public keys. Enables exclusive PKI authentication.
-    #[arg(long, value_delimiter = ',', requires = "pki_audience")]
+    #[arg(
+        long,
+        env = "S2LITE_PKI_ISSUER",
+        value_delimiter = ',',
+        requires = "pki_audience"
+    )]
     pub pki_issuer: Vec<String>,
     /// Canonical external origin used by PKI grants and request signatures.
-    #[arg(long, requires = "pki_issuer")]
+    #[arg(long, env = "S2LITE_PKI_AUDIENCE", requires = "pki_issuer")]
     pub pki_audience: Option<String>,
 
     /// Name of the S3 bucket to back the database.
@@ -124,6 +130,30 @@ pub struct LiteArgs {
     pub append_inflight_bytes: ByteSize,
 }
 
+impl LiteArgs {
+    fn pki_config(&self) -> eyre::Result<Option<(s2_pki_auth::TrustedIssuers, String)>> {
+        match (self.pki_issuer.is_empty(), self.pki_audience.as_ref()) {
+            (true, None) => Ok(None),
+            (false, Some(audience)) => {
+                let issuers = self
+                    .pki_issuer
+                    .iter()
+                    .map(|key| s2_pki_auth::ClientPublicKey::from_base58(key))
+                    .collect::<s2_pki_auth::Result<Vec<_>>>()
+                    .wrap_err("Invalid PKI configuration")?;
+                crate::pki::validate_audience(audience).wrap_err("Invalid PKI configuration")?;
+                Ok(Some((
+                    s2_pki_auth::TrustedIssuers::new(issuers),
+                    audience.clone(),
+                )))
+            }
+            _ => Err(eyre::eyre!(
+                "PKI issuer and audience must be configured together"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum StoreType {
     S3Bucket(String),
@@ -197,6 +227,8 @@ fn cli_env_hint(protocol: ServerProtocol, port: u16) -> String {
 }
 
 pub async fn run(args: LiteArgs) -> eyre::Result<()> {
+    // Validate both CLI and programmatic configuration before storage or startup effects.
+    let pki_config = args.pki_config()?;
     info!(?args);
 
     let protocol = ServerProtocol::from_args(&args);
@@ -268,15 +300,10 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
         init::apply(&backend, spec).await?;
     }
 
-    let router = if let Some(audience) = args.pki_audience {
-        let issuers = args
-            .pki_issuer
-            .iter()
-            .map(|key| s2_pki_auth::ClientPublicKey::from_base58(key))
-            .collect::<s2_pki_auth::Result<Vec<_>>>()?;
+    let router = if let Some((issuers, audience)) = pki_config {
         handlers::router_with_pki(crate::pki::PkiAuthState::new(
             backend.clone(),
-            s2_pki_auth::TrustedIssuers::new(issuers),
+            issuers,
             audience,
         )?)
     } else {
@@ -615,6 +642,51 @@ impl object_store::CredentialProvider for S3CredentialProvider {
 #[cfg(test)]
 mod tests {
     use super::{ServerProtocol, WalS3Overrides, cli_endpoint, cli_env_hint};
+
+    #[tokio::test]
+    async fn invalid_programmatic_pki_config_fails_before_storage_initialization() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestArgs {
+            #[command(flatten)]
+            args: super::LiteArgs,
+        }
+        let root = s2_pki_auth::ClientKey::generate()
+            .public_key()
+            .to_base58()
+            .to_owned();
+        let path =
+            std::env::temp_dir().join(format!("s2-pki-invalid-store-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "not a directory").unwrap();
+        for (issuers, audience) in [
+            (vec![root.clone()], None),
+            (vec![], Some("http://example.test".to_owned())),
+            (
+                vec!["invalid-root".to_owned()],
+                Some("http://example.test".to_owned()),
+            ),
+            (vec![root.clone()], Some("invalid-audience".to_owned())),
+        ] {
+            let mut args = TestArgs::try_parse_from([
+                "lite",
+                "--pki-issuer",
+                &root,
+                "--pki-audience",
+                "http://example.test",
+            ])
+            .unwrap()
+            .args;
+            args.pki_issuer = issuers;
+            args.pki_audience = audience;
+            args.local_root = Some(path.clone());
+            let error = super::run(args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("PKI"),
+                "invalid auth configuration must fail before touching storage: {error}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn wal_config(values: &[(&str, &str)]) -> eyre::Result<WalS3Overrides> {
         WalS3Overrides::from_getter(|name| {

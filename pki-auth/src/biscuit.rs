@@ -411,6 +411,24 @@ fn literal_blocks(biscuit: &Biscuit) -> Result<Vec<BlockBuilder>> {
 }
 
 fn read_block(block: &BlockBuilder, index: usize) -> Result<BlockMetadata> {
+    // Public-key scopes resolve across the complete token, including future
+    // blocks with that signer. This profile permits only fixed prefix origins,
+    // so every custom restriction stays cumulative after delegation.
+    if block
+        .scopes
+        .iter()
+        .chain(block.rules.iter().flat_map(|rule| &rule.scopes))
+        .chain(
+            block
+                .checks
+                .iter()
+                .flat_map(|check| &check.queries)
+                .flat_map(|query| &query.scopes),
+        )
+        .any(|scope| matches!(scope, Scope::PublicKey(_)))
+    {
+        return Err(AuthError::InvalidGrant);
+    }
     for f in &block.facts {
         let name = f.predicate.name.as_str();
         if ambient_predicate(name) {

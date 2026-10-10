@@ -77,6 +77,24 @@ impl VerifiedRequest {
         }
         authorize_collection(&self.capability, operation, basin, now)
     }
+    /// Preflight before reading provisioning metadata. An ensure may create or
+    /// reconfigure; the host must also authorize the actual outcome after lookup.
+    pub fn authorize_provision_stream(
+        &self,
+        basin: &str,
+        stream: &str,
+        ensure: bool,
+        now: i64,
+    ) -> Result<()> {
+        self.authorize(Operation::CreateStream, Some(basin), Some(stream), now)
+            .or_else(|error| {
+                if ensure {
+                    self.authorize(Operation::ReconfigureStream, Some(basin), Some(stream), now)
+                } else {
+                    Err(error)
+                }
+            })
+    }
     pub fn authorize(
         &self,
         op: s2_common::access::Operation,
@@ -88,17 +106,6 @@ impl VerifiedRequest {
             return Err(AuthError::PermissionDenied);
         }
         authorize_operation(&self.capability, op, basin, stream, now)
-    }
-}
-/// Signed stream openings require HTTPS; HTTP is allowed only for loopback development.
-pub fn validate_streaming_transport(uri: &Uri) -> Result<()> {
-    if uri.scheme_str() == Some("https")
-        || (uri.scheme_str() == Some("http")
-            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
-    {
-        Ok(())
-    } else {
-        Err(AuthError::Audience)
     }
 }
 fn sigerr(_: impl std::fmt::Display) -> AuthError {

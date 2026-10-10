@@ -151,9 +151,6 @@ pub fn validate_destination(
             return Err("PKI credential audience does not match the configured endpoints".into());
         }
     }
-    if config.ssl_no_verify == Some(true) {
-        return Err("PKI streaming requires verified TLS; disable ssl_no_verify".into());
-    }
     Ok(())
 }
 pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
@@ -268,7 +265,6 @@ pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
             config.auth_method = Some(AuthMethod::Pki);
             config.account_endpoint = Some(credentials.audience().into());
             config.basin_endpoint = Some(credentials.audience().into());
-            config.ssl_no_verify = Some(false);
             if let Err(e) = config::save_cli_config(&config) {
                 let _ = credential_store::delete(CredentialKind::Pki, &id, store);
                 return Err(e.into());
