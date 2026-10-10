@@ -1,9 +1,11 @@
 //! Client-key authentication and Biscuit authorization for S2.
 //! Permission evaluation has no database dependency.
 mod biscuit;
+mod collection;
 mod keys;
 mod policy;
 pub use biscuit::*;
+pub use collection::*;
 pub use keys::*;
 
 pub type Result<T> = std::result::Result<T, AuthError>;
@@ -21,6 +23,8 @@ pub enum AuthError {
     Audience,
     #[error("operation is outside the grant")]
     PermissionDenied,
+    #[error("listing work limit exceeded")]
+    ListWorkLimit,
     #[error("invalid HTTP message signature")]
     Signature,
     #[error("Biscuit verification failed: {0}")]

@@ -61,7 +61,15 @@ fn bounded_op(op: &Op) -> bool {
     }
 }
 
-pub(crate) fn validate_policy_budget(blocks: &[BlockBuilder]) -> Result<()> {
+// Conservative logical work charge: literal entries/fact visits,
+// fixed native profile queries, and every custom expression alternative.
+// This is not a CPU-time or byte-allocation measurement.
+pub(crate) const MAX_EVALUATION_WORK: usize = 1
+    + MAX_FACTS
+    + MAX_CUSTOM_WORK
+    + crate::MAX_GRANT_BLOCKS * NATIVE_QUERIES_PER_BLOCK * (MAX_FACTS + AMBIENT_FACTS);
+
+pub(crate) fn validate_policy_budget(blocks: &[BlockBuilder]) -> Result<usize> {
     let facts = blocks.iter().map(|block| block.facts.len()).sum::<usize>();
     if facts > MAX_FACTS {
         return Err(AuthError::InvalidGrant);
@@ -133,7 +141,7 @@ pub(crate) fn validate_policy_budget(blocks: &[BlockBuilder]) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(1 + facts + work + blocks.len() * NATIVE_QUERIES_PER_BLOCK * (facts + AMBIENT_FACTS))
 }
 
 pub(crate) fn validate_serialized_policy(encoded: &[u8]) -> Result<()> {

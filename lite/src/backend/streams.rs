@@ -38,10 +38,18 @@ impl Backend {
         basin: BasinName,
         request: ListStreamsRequest,
     ) -> Result<Page<StreamInfo>, ListStreamsError> {
-        self.authorize_collection(
-            s2_common::access::Operation::ListStreams,
-            Some(basin.as_ref()),
-        )?;
+        let mut authorization = self
+            .pki
+            .as_ref()
+            .map(|identity| {
+                identity.collection_authorizer(
+                    s2_common::access::Operation::ListStreams,
+                    Some(basin.as_ref()),
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            })
+            .transpose()
+            .map_err(super::error::StorageError::from)?;
         let ListStreamsRequest {
             prefix,
             start_after,
@@ -49,6 +57,17 @@ impl Backend {
         } = request;
 
         let key_range = kv::stream_meta::ser_key_range(&basin, &prefix, &start_after);
+        let key_range = if let Some(auth) = &authorization {
+            super::pki::intersect_list_range(key_range, auth.resource_scope(), |value| {
+                let prefix = value.parse::<s2_common::stream::StreamNamePrefix>().ok()?;
+                Some(
+                    kv::stream_meta::ser_key_prefix(&basin, &prefix)
+                        ..kv::stream_meta::ser_key_prefix_end(&basin, &prefix),
+                )
+            })
+        } else {
+            key_range
+        };
         if key_range.is_empty() {
             return Ok(Page::new_empty());
         }
@@ -66,13 +85,13 @@ impl Backend {
             assert_eq!(deser_basin.as_ref(), basin.as_ref());
             assert!(stream.as_ref() > start_after.as_ref());
             assert!(stream.as_ref() >= prefix.as_ref());
-            if self
-                .authorize(
-                    s2_common::access::Operation::ListStreams,
-                    Some(basin.as_ref()),
-                    Some(stream.as_ref()),
-                )
-                .is_err()
+            if let Some(auth) = &mut authorization
+                && !auth
+                    .authorize_candidate(
+                        stream.as_ref(),
+                        OffsetDateTime::now_utc().unix_timestamp(),
+                    )
+                    .map_err(super::error::StorageError::from)?
             {
                 continue;
             }
@@ -87,6 +106,10 @@ impl Backend {
                 deleted_at: meta.deleted_at,
                 cipher: meta.cipher,
             });
+        }
+        if let Some(auth) = &authorization {
+            auth.check_active(OffsetDateTime::now_utc().unix_timestamp())
+                .map_err(super::error::StorageError::from)?;
         }
         Ok(Page::new(streams, has_more))
     }

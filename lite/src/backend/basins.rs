@@ -29,7 +29,18 @@ impl Backend {
         &self,
         request: ListBasinsRequest,
     ) -> Result<Page<BasinInfo>, ListBasinsError> {
-        self.authorize_collection(s2_common::access::Operation::ListBasins, None)?;
+        let mut authorization = self
+            .pki
+            .as_ref()
+            .map(|identity| {
+                identity.collection_authorizer(
+                    s2_common::access::Operation::ListBasins,
+                    None,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            })
+            .transpose()
+            .map_err(super::error::StorageError::from)?;
         let ListBasinsRequest {
             prefix,
             start_after,
@@ -37,6 +48,17 @@ impl Backend {
         } = request;
 
         let key_range = kv::basin_meta::ser_key_range(&prefix, &start_after);
+        let key_range = if let Some(auth) = &authorization {
+            super::pki::intersect_list_range(key_range, auth.resource_scope(), |value| {
+                let prefix = value.parse::<s2_common::basin::BasinNamePrefix>().ok()?;
+                Some(
+                    kv::basin_meta::ser_key_prefix(&prefix)
+                        ..kv::basin_meta::ser_key_prefix_end(&prefix),
+                )
+            })
+        } else {
+            key_range
+        };
         if key_range.is_empty() {
             return Ok(Page::new_empty());
         }
@@ -53,13 +75,10 @@ impl Backend {
             let basin = kv::basin_meta::deser_key(kv.key)?;
             assert!(basin.as_ref() > start_after.as_ref());
             assert!(basin.as_ref() >= prefix.as_ref());
-            if self
-                .authorize(
-                    s2_common::access::Operation::ListBasins,
-                    Some(basin.as_ref()),
-                    None,
-                )
-                .is_err()
+            if let Some(auth) = &mut authorization
+                && !auth
+                    .authorize_candidate(basin.as_ref(), OffsetDateTime::now_utc().unix_timestamp())
+                    .map_err(super::error::StorageError::from)?
             {
                 continue;
             }
@@ -74,6 +93,10 @@ impl Backend {
                 created_at: meta.created_at,
                 deleted_at: meta.deleted_at,
             });
+        }
+        if let Some(auth) = &authorization {
+            auth.check_active(OffsetDateTime::now_utc().unix_timestamp())
+                .map_err(super::error::StorageError::from)?;
         }
         Ok(Page::new(basins, has_more))
     }

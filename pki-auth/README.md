@@ -99,11 +99,29 @@ Stream provisioning performs a shared-crate preflight before reading metadata.
 An ensure requires at least one of CreateStream/ReconfigureStream initially,
 then the actual operation is checked after determining existence. Forbidden
 requests cannot disclose whether the basin is absent, present, or deleting.
-For listings, `authorize_collection` evaluates native operation, expiry,
-audience, and known-basin checks first; the host must then call
-`authorize_operation` with each candidate's
-resource facts before exposing it or counting it toward pagination. A resource
-check can therefore produce an empty allowed result without blocking the list.
+For listings, use one `VerifiedRequest::collection_authorizer` per request.
+It preflights native operation, expiry, audience and known-basin checks, then
+`authorize_candidate` evaluates cumulative native policy with each candidate's
+resource facts. Only allowed candidates contribute to output or `has_more`.
+Every evaluated candidate consumes work, including denied rows and pagination
+lookahead. The shared crate caps 4096 candidates and separately charges aggregate
+logical policy work (literal facts, fixed profile queries and all custom query
+alternatives). The work ceiling permits at least 1001 worst-profile evaluations,
+so a fully authorized maximum page plus lookahead fits. These are structural
+bounds, not CPU-time or allocation measurements.
+
+Lite intersects the request prefix/start-after range with the verified leaf
+literal Exact/Prefix/None scope, as an optimization; every output still requires
+full native authorization. An exact scope excludes extension names. Custom
+checks can produce empty or sparse allowed pages when the scan fits its budget.
+Expiry aborts a scan rather than filtering its remaining rows. On exhaustion,
+Lite returns `invalid` (HTTP 422) with a generic message and discards the whole
+partial page. It never returns denied names/counts, a scanned-key cursor, or a
+`has_more` inferred from denied candidates. Narrow the request prefix to bound a
+large sparse scan; no new continuation format is introduced. Embedding hosts
+must likewise stop on budget/expiry errors, discard partial output and check
+`check_active` before completing a scan. Bare `authorize_collection` preflight
+alone does not bound a subsequent scan.
 The host must consume the nonce atomically and check every revocation identifier
 before accepting a request. `VerifiedRequest::validate_admission` must pass
 both before replay-state work and after durable nonce consumption, immediately

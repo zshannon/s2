@@ -337,6 +337,10 @@ fn standard(code: ErrorCode, message: impl Into<String>) -> ErrorResponse {
 
 fn storage(e: &crate::backend::error::StorageError) -> ErrorResponse {
     match e {
+        crate::backend::error::StorageError::ListWorkLimit => {
+            // Nonretryable; no scanned resource, count, partial page or cursor.
+            standard(ErrorCode::Invalid, "Listing work limit exceeded")
+        }
         crate::backend::error::StorageError::PermissionDenied => {
             standard(ErrorCode::PermissionDenied, "Permission denied")
         }

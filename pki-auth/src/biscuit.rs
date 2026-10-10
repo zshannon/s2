@@ -109,7 +109,8 @@ impl Grant {
     }
 }
 // Metadata is read from the literal facts of each authenticated block. It is
-// used for identity/delegation validation and inspection, never permission evaluation.
+// used for identity/delegation validation, inspection and scan optimization,
+// never as a replacement for native permission evaluation.
 #[derive(Clone, Debug)]
 struct BlockMetadata {
     client: ClientPublicKey,
@@ -126,6 +127,7 @@ pub struct VerifiedCapability {
     metadata: BlockMetadata,
     blocks: Vec<BlockBuilder>,
     revocation_ids: Vec<Vec<u8>>,
+    pub(crate) evaluation_work: usize,
 }
 impl std::fmt::Debug for VerifiedCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -578,7 +580,7 @@ pub fn verify_biscuit(
     }
     crate::policy::validate_serialized_policy(encoded)?;
     let blocks = literal_blocks(&biscuit)?;
-    crate::policy::validate_policy_budget(&blocks)?;
+    let evaluation_work = crate::policy::validate_policy_budget(&blocks)?;
     let mut current = read_block(&blocks[0], 0)?;
     if current.parent.is_some() || (!audience.is_empty() && current.audience != audience) {
         return Err(AuthError::Audience);
@@ -610,6 +612,7 @@ pub fn verify_biscuit(
         metadata: current,
         blocks,
         revocation_ids: ids,
+        evaluation_work,
     })
 }
 pub fn issue_grant(

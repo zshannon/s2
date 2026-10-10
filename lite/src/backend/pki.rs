@@ -45,22 +45,6 @@ impl Backend {
         }
         Ok(())
     }
-    pub(super) fn authorize_collection(
-        &self,
-        operation: Operation,
-        basin: Option<&str>,
-    ) -> Result<(), StorageError> {
-        if let Some(identity) = &self.pki {
-            identity
-                .authorize_collection(
-                    operation,
-                    basin,
-                    time::OffsetDateTime::now_utc().unix_timestamp(),
-                )
-                .map_err(|_| StorageError::PermissionDenied)?;
-        }
-        Ok(())
-    }
     pub async fn pki_not_revoked(&self, ids: &[Vec<u8>]) -> Result<bool, StorageError> {
         not_revoked(&self.db, ids).await
     }
@@ -175,168 +159,31 @@ pub(super) async fn not_revoked(db: &slatedb::Db, ids: &[Vec<u8>]) -> Result<boo
     Ok(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{sync::Arc, time::Duration};
-
-    use bytesize::ByteSize;
-    use http::{HeaderMap, Method};
-    use s2_pki_auth::*;
-    use slatedb::{Db, config::Settings, object_store::memory::InMemory};
-
-    use super::*;
-
-    async fn backend() -> Backend {
-        let db = Db::builder(
-            format!("pki-races-{}", uuid::Uuid::new_v4()),
-            Arc::new(InMemory::new()),
-        )
-        .with_settings(Settings {
-            flush_interval: Some(Duration::from_millis(5)),
-            ..Default::default()
-        })
-        .build()
-        .await
-        .unwrap();
-        Backend::new(db, ByteSize::mib(10))
+/// Intersect storage selection with verified literal scope, retaining per-row
+/// native authorization. Invalid resource prefixes cannot match stored names.
+pub(super) fn intersect_list_range(
+    range: std::ops::Range<bytes::Bytes>,
+    scope: &s2_pki_auth::ResourceScope,
+    prefix_range: impl FnOnce(&str) -> Option<std::ops::Range<bytes::Bytes>>,
+) -> std::ops::Range<bytes::Bytes> {
+    use s2_pki_auth::ResourceScope;
+    let value = match scope {
+        ResourceScope::Any => return range,
+        ResourceScope::None => return range.start.clone()..range.start,
+        ResourceScope::Exact(value) | ResourceScope::Prefix(value) => value,
+    };
+    let Some(mut scoped) = prefix_range(value) else {
+        return range.start.clone()..range.start;
+    };
+    if matches!(scope, ResourceScope::Exact(_)) {
+        // Names contain no NUL. This exclusive end contains only the exact key,
+        // never extension names that happen to share the same prefix.
+        let mut end = scoped.start.to_vec();
+        end.push(0);
+        scoped.end = end.into();
     }
-    fn identity(created: i64, verified_at: i64) -> VerifiedRequest {
-        let issuer = ClientKey::generate();
-        let holder = ClientKey::generate();
-        let grant = issue_grant(
-            &issuer,
-            &holder.public_key(),
-            "http://localhost",
-            &GrantScope::new(
-                ResourceScope::Any,
-                ResourceScope::Any,
-                vec![Operation::Read],
-            ),
-            2_000_000_000,
-        )
-        .unwrap();
-        let credentials = PkiCredentials::new(holder, grant).unwrap();
-        let uri = "http://localhost/v1/streams/events/records"
-            .parse()
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        sign_request(
-            &credentials,
-            &Method::GET,
-            &uri,
-            &mut headers,
-            RequestBody::Unary(b""),
-            created,
-        )
-        .unwrap();
-        verify_request(
-            &TrustedIssuers::new(vec![issuer.public_key()]),
-            "http://localhost",
-            &Method::GET,
-            &uri,
-            &headers,
-            RequestBody::Unary(b""),
-            verified_at,
-        )
-        .unwrap()
-    }
-    #[tokio::test]
-    async fn pending_proofs_cannot_be_admitted_after_expiry() {
-        let backend = backend().await;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let identity = identity(now, now);
-        let expiry = identity.proof_expires_at();
-        assert!(identity.lease_expires_at() > expiry);
-        for _ in 0..2 {
-            assert!(
-                !backend
-                    .pki_accept_nonce_with_clock(&identity, || expiry)
-                    .await
-                    .unwrap(),
-                "pending verified proofs must not reopen expired replay state"
-            );
-        }
-        backend.close().await.unwrap();
-    }
-    #[tokio::test]
-    async fn stale_expiry_indexes_cannot_delete_a_renewed_nonce() {
-        let backend = backend().await;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let key = b"\xf0renewed-nonce".to_vec();
-        let mut index = vec![0xf2];
-        index.extend((now - 1).to_be_bytes());
-        index.extend(&key);
-        let expired_key = b"\xf0expired-nonce".to_vec();
-        let mut expired_index = vec![0xf2];
-        expired_index.extend((now - 2).to_be_bytes());
-        expired_index.extend(&expired_key);
-        // This is the state seen by a stale cleanup after another request has
-        // replaced the expired nonce with a newer admitted value.
-        let txn = backend
-            .db
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await
-            .unwrap();
-        txn.put(&index, &key).unwrap();
-        txn.put(&key, (now + 60).to_be_bytes()).unwrap();
-        txn.put(&expired_index, &expired_key).unwrap();
-        txn.put(&expired_key, (now - 2).to_be_bytes()).unwrap();
-        db_txn_commit_durable(txn).await.unwrap();
-        backend.pki_cleanup_nonces().await.unwrap();
-        assert_eq!(
-            backend.db.get(&key).await.unwrap().as_deref(),
-            Some((now + 60).to_be_bytes().as_slice()),
-            "cleanup must preserve the newer nonce value"
-        );
-        assert!(backend.db.get(&index).await.unwrap().is_none());
-        assert!(backend.db.get(&expired_index).await.unwrap().is_none());
-        assert!(backend.db.get(&expired_key).await.unwrap().is_none());
-        backend.close().await.unwrap();
-    }
-    #[tokio::test]
-    async fn proof_expiring_during_durable_nonce_admission_is_rejected() {
-        use std::sync::atomic::{AtomicI64, Ordering};
-        let backend = backend().await;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let identity = identity(now, now);
-        let clock = AtomicI64::new(identity.proof_expires_at() - 1);
-        assert!(
-            !backend
-                .pki_accept_nonce_with_clock(&identity, || clock.fetch_add(1, Ordering::SeqCst))
-                .await
-                .unwrap(),
-            "proof freshness must be checked after awaited durable admission"
-        );
-        // An admitted session has its own longer lease; proof freshness must
-        // not be imposed on its subsequent native operation checks.
-        identity
-            .authorize(
-                Operation::Read,
-                Some("logs"),
-                Some("events"),
-                identity.proof_expires_at() + 1,
-            )
-            .unwrap();
-        backend.close().await.unwrap();
-    }
-    #[tokio::test]
-    async fn fresh_nonce_admission_is_once_only() {
-        let backend = backend().await;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let identity = identity(now, now);
-        let clock = || identity.proof_expires_at() - 1;
-        assert!(
-            backend
-                .pki_accept_nonce_with_clock(&identity, clock)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !backend
-                .pki_accept_nonce_with_clock(&identity, clock)
-                .await
-                .unwrap()
-        );
-        backend.close().await.unwrap();
-    }
+    std::cmp::max(range.start, scoped.start)..std::cmp::min(range.end, scoped.end)
 }
+
+#[cfg(test)]
+mod tests;
