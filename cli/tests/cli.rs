@@ -817,6 +817,7 @@ fn lite_invalid_environment_root_fails_startup() {
         ("", "http://example.test"),
         ("", ""),
         (root.as_str(), "invalid-origin"),
+        (root.as_str(), "http://example.test/"),
     ] {
         env.s2()
             .args(["lite", "--port", "0"])

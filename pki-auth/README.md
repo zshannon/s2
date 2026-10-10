@@ -183,7 +183,8 @@ S2LITE_PKI_AUDIENCE=https://streams.example.com s2 lite
 
 Lite accepts the trusted root public key through `S2LITE_PKI_ISSUER` (or
 `--pki-issuer`), with optional comma-separated roots for rotation. Set the exact
-HTTP grant origin in `S2LITE_PKI_AUDIENCE` (or `--pki-audience`). Providing one
+HTTP grant origin in `S2LITE_PKI_AUDIENCE` (or `--pki-audience`), formatted as
+`scheme://host[:port]` with no trailing slash. Providing one
 without the other, an invalid root key, or an invalid origin fails startup
 before storage initialization. A complete pair activates exclusive PKI
 verification for the API; grant files and request headers cannot select trusted

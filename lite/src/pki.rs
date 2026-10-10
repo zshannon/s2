@@ -48,10 +48,11 @@ pub(crate) fn validate_audience(audience: &str) -> s2_pki_auth::Result<()> {
     let uri: Uri = audience
         .parse()
         .map_err(|_| s2_pki_auth::AuthError::Audience)?;
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || uri.authority().is_none()
-        || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
-    {
+    let scheme = uri.scheme_str().ok_or(s2_pki_auth::AuthError::Audience)?;
+    let authority = uri.authority().ok_or(s2_pki_auth::AuthError::Audience)?;
+    // Request proofs compare against exactly scheme://authority. Keep the
+    // original spelling so an accepted configuration can match that identity.
+    if !matches!(scheme, "http" | "https") || audience != format!("{scheme}://{authority}") {
         return Err(s2_pki_auth::AuthError::Audience);
     }
     Ok(())

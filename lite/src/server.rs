@@ -666,6 +666,7 @@ mod tests {
                 Some("http://example.test".to_owned()),
             ),
             (vec![root.clone()], Some("invalid-audience".to_owned())),
+            (vec![root.clone()], Some("http://example.test/".to_owned())),
         ] {
             let mut args = TestArgs::try_parse_from([
                 "lite",
