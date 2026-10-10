@@ -4,7 +4,7 @@ use crate::backend::Backend;
 
 pub mod access_tokens;
 pub mod basins;
-mod error;
+pub(crate) mod error;
 pub mod locations;
 pub mod metrics;
 pub mod paths;

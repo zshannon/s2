@@ -119,6 +119,8 @@ impl TestEnv {
             "S2_BASIN_ENDPOINT",
             "S2_COMPRESSION",
             "S2_SSL_NO_VERIFY",
+            "S2LITE_PKI_ISSUER",
+            "S2LITE_PKI_AUDIENCE",
         ] {
             cmd.env_remove(key);
         }
@@ -613,4 +615,360 @@ fn only_account_endpoint_set_warns_and_uses_defaults() {
         !stderr.contains("Unable to parse S2 endpoints"),
         "stderr should not report an endpoint parse error, got: {stderr}"
     );
+}
+
+#[test]
+fn pki_credentials_replace_environment_bearer_tokens_and_keep_keys_out_of_config() {
+    use s2_common::access::Operation;
+    use s2_pki_auth::*;
+    let env = TestEnv::new();
+    let server = TestServer::start();
+    let issuer = ClientKey::generate();
+    let client = ClientKey::generate();
+    let grant = issue_grant(
+        &issuer,
+        &client.public_key(),
+        &server.endpoint,
+        &GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::ListBasins],
+        ),
+        2_000_000_000,
+    )
+    .unwrap();
+    let key_file = env.home.path().join("client.key");
+    let grant_file = env.home.path().join("grant.json");
+    std::fs::write(&key_file, client.to_base58()).unwrap();
+    std::fs::write(
+        &grant_file,
+        serde_json::json!({"issuer":issuer.public_key().to_base58(),"grant":grant.to_base64()})
+            .to_string(),
+    )
+    .unwrap();
+    env.s2()
+        .args(["config", "set", "ssl_no_verify", "true"])
+        .assert()
+        .success();
+    env.s2()
+        .args([
+            "auth",
+            "pki",
+            "set",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--grant-file",
+            grant_file.to_str().unwrap(),
+            "--insecure-storage",
+        ])
+        .assert()
+        .success();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    assert!(!config.contains(&client.to_base58()));
+    assert!(config.contains("pki"));
+    assert!(config.contains("ssl_no_verify = true"));
+    env.s2()
+        .args(["list-basins"])
+        .env("S2_ACCESS_TOKEN", "invalid-bearer-must-be-ignored")
+        .assert()
+        .success();
+    let observed = server.finish();
+    assert!(observed.contains("authorization: Biscuit "));
+    assert!(observed.contains("signature-input: s2="));
+    assert!(!observed.contains("invalid-bearer"));
+}
+
+struct LiteProcess(std::process::Child);
+impl Drop for LiteProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn lite_environment_root_enables_exclusive_pki_authentication() {
+    use s2_pki_auth::*;
+    let env = TestEnv::new();
+    let issuer = ClientKey::generate();
+    let key = ClientKey::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let audience = format!("http://127.0.0.1:{port}");
+    let startup_log = env.home.path().join("lite-startup.log");
+    let mut process = LiteProcess(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("s2"))
+            .args(["lite", "--port", &port.to_string()])
+            .env("HOME", env.home.path())
+            .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
+            .env("S2LITE_PKI_ISSUER", issuer.public_key().to_base58())
+            .env("S2LITE_PKI_AUDIENCE", &audience)
+            .env("RUST_LOG", "info")
+            .stdout(std::fs::File::create(&startup_log).unwrap())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let target = format!("{audience}/v1/basins");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = client.get(&target).send().await {
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "root ENV configuration must activate PKI"
+            );
+            break;
+        }
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "Lite exited before serving"
+        );
+        assert!(tokio::time::Instant::now() < deadline, "Lite did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        client
+            .get(&target)
+            .bearer_auth("untrusted-bearer")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    for (root, expected) in [
+        (issuer, reqwest::StatusCode::OK),
+        (ClientKey::generate(), reqwest::StatusCode::UNAUTHORIZED),
+    ] {
+        let grant = issue_grant(
+            &root,
+            &key.public_key(),
+            &audience,
+            &GrantScope::new(
+                ResourceScope::Any,
+                ResourceScope::Any,
+                vec![Operation::ListBasins],
+            ),
+            2_000_000_000,
+        )
+        .unwrap();
+        let credentials = PkiCredentials::new(key.clone(), grant).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ACCEPT, "*/*".parse().unwrap());
+        sign_request(
+            &credentials,
+            &reqwest::Method::GET,
+            &target.parse().unwrap(),
+            &mut headers,
+            RequestBody::Unary(b""),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .get(&target)
+                .headers(headers)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+    let startup = std::fs::read_to_string(startup_log).unwrap();
+    assert!(
+        !startup.contains("S2_ACCESS_TOKEN"),
+        "PKI startup must not recommend bearer credentials: {startup}"
+    );
+    assert!(
+        startup.contains("s2 auth pki set"),
+        "PKI startup should identify the credential setup command: {startup}"
+    );
+}
+
+fn pki_inputs(env: &TestEnv) -> (std::path::PathBuf, std::path::PathBuf) {
+    use s2_pki_auth::*;
+    let issuer = ClientKey::generate();
+    let key = ClientKey::generate();
+    let grant = issue_grant(
+        &issuer,
+        &key.public_key(),
+        "http://localhost",
+        &GrantScope::new(
+            ResourceScope::Any,
+            ResourceScope::Any,
+            vec![Operation::ListBasins],
+        ),
+        2_000_000_000,
+    )
+    .unwrap();
+    let key_file = env.home.path().join("cleanup-client.key");
+    let grant_file = env.home.path().join("cleanup-grant.json");
+    std::fs::write(&key_file, key.to_base58()).unwrap();
+    std::fs::write(
+        &grant_file,
+        serde_json::json!({"issuer": issuer.public_key().to_base58(), "grant": grant.to_base64()})
+            .to_string(),
+    )
+    .unwrap();
+    (key_file, grant_file)
+}
+
+fn selected_pki(env: &TestEnv) -> (String, std::path::PathBuf) {
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap())
+            .unwrap();
+    let id = config["pki"]["credential_id"].as_str().unwrap().to_owned();
+    let file = std::fs::read_dir(env.config_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pki-")
+        })
+        .unwrap();
+    (id, file)
+}
+
+#[test]
+fn pki_remove_retains_failed_cleanup_for_retry() {
+    let env = TestEnv::new();
+    let (key, grant) = pki_inputs(&env);
+    env.s2()
+        .args([
+            "auth",
+            "pki",
+            "set",
+            "--key-file",
+            key.to_str().unwrap(),
+            "--grant-file",
+            grant.to_str().unwrap(),
+            "--insecure-storage",
+        ])
+        .assert()
+        .success();
+    let (id, file) = selected_pki(&env);
+    let saved = file.with_extension("saved");
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().failure();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    assert!(
+        config.contains(&id),
+        "failed deletion must retain its cleanup ID: {config}"
+    );
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert!(
+        parsed.get("pki").is_none(),
+        "credential must be deactivated before cleanup"
+    );
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&saved, &file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().success();
+    assert!(!file.exists(), "retry must erase the original credential");
+    assert!(
+        !std::fs::read_to_string(env.config_dir().join("config.toml"))
+            .unwrap()
+            .contains(&id)
+    );
+}
+
+#[test]
+fn pki_replacement_retains_failed_old_cleanup_for_retry() {
+    let env = TestEnv::new();
+    let (key, grant) = pki_inputs(&env);
+    let args = [
+        "auth",
+        "pki",
+        "set",
+        "--key-file",
+        key.to_str().unwrap(),
+        "--grant-file",
+        grant.to_str().unwrap(),
+        "--insecure-storage",
+    ];
+    env.s2().args(args).assert().success();
+    let (id, file) = selected_pki(&env);
+    let saved = file.with_extension("saved");
+    std::fs::rename(&file, &saved).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    env.s2().args(args).assert().failure();
+    let config = std::fs::read_to_string(env.config_dir().join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_ne!(parsed["pki"]["credential_id"].as_str().unwrap(), id);
+    assert!(
+        config.contains(&id),
+        "replacement must retain the old cleanup ID: {config}"
+    );
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&saved, &file).unwrap();
+    env.s2().args(["auth", "pki", "remove"]).assert().success();
+    assert!(!file.exists(), "retry must erase the old credential");
+    assert!(
+        !std::fs::read_dir(env.config_dir())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pki-")),
+        "removal must erase both credentials"
+    );
+}
+
+#[test]
+fn lite_incomplete_environment_pki_configuration_fails_startup() {
+    let env = TestEnv::new();
+    let root = s2_pki_auth::ClientKey::generate()
+        .public_key()
+        .to_base58()
+        .to_owned();
+    for (name, value, required) in [
+        ("S2LITE_PKI_ISSUER", root.as_str(), "--pki-audience"),
+        ("S2LITE_PKI_AUDIENCE", "http://example.test", "--pki-issuer"),
+    ] {
+        env.s2()
+            .args(["lite", "--port", "0"])
+            .env(name, value)
+            .timeout(Duration::from_secs(2))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(required));
+    }
+}
+
+#[test]
+fn lite_invalid_environment_root_fails_startup() {
+    let env = TestEnv::new();
+    let root = s2_pki_auth::ClientKey::generate()
+        .public_key()
+        .to_base58()
+        .to_owned();
+    for (issuer, audience) in [
+        ("invalid-key", "http://example.test"),
+        ("", "http://example.test"),
+        ("", ""),
+        (root.as_str(), "invalid-origin"),
+        (root.as_str(), "http://example.test/"),
+    ] {
+        env.s2()
+            .args(["lite", "--port", "0"])
+            .env("S2LITE_PKI_ISSUER", issuer)
+            .env("S2LITE_PKI_AUDIENCE", audience)
+            .timeout(Duration::from_secs(2))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("PKI"));
+    }
 }

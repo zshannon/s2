@@ -21,12 +21,18 @@ mod test_util;
 
 mod append;
 mod kv;
+mod pki;
 
 pub use core::Backend;
 
 pub use crate::stream_id::StreamId;
 
 pub struct StreamHandle {
+    pki: Option<(
+        s2_pki_auth::VerifiedRequest,
+        s2_common::basin::BasinName,
+        s2_common::stream::StreamName,
+    )>,
     db: slatedb::Db,
     client: streamer::GuardedStreamerClient,
     encryption: EncryptionSpec,

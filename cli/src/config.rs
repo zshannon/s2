@@ -49,6 +49,9 @@ impl From<Compression> for sdk::types::Compression {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CliConfig {
+    pub pki: Option<StoredCredentialReference>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_pki_cleanup: Vec<StoredCredentialReference>,
     /// Legacy plaintext access token. New writes use `stored_access_token`.
     pub access_token: Option<String>,
     pub stored_access_token: Option<StoredCredentialReference>,
@@ -68,6 +71,9 @@ pub struct CliConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum AuthMethod {
+    /// Client HTTP signatures and Biscuit grants.
+    #[serde(rename = "pki")]
+    Pki,
     /// A stored S2 access token.
     #[serde(rename = "access_token")]
     #[value(name = "access-token")]
@@ -374,6 +380,7 @@ pub async fn select_auth_method(method: AuthMethod) -> Result<PathBuf, CliConfig
     let _lock = acquire_config_lock().await?;
     let mut config = load_config_file()?;
     match method {
+        AuthMethod::Pki if config.pki.is_none() => return Err(CliConfigError::PkiNotConfigured),
         AuthMethod::AccessToken if !config.has_stored_access_token() => {
             return Err(CliConfigError::StoredAccessTokenNotConfigured);
         }
@@ -388,7 +395,7 @@ pub async fn select_auth_method(method: AuthMethod) -> Result<PathBuf, CliConfig
 
 pub fn sdk_config(
     config: &CliConfig,
-    access_token: &str,
+    authentication: S2Config,
     user_agent: &str,
 ) -> Result<S2Config, CliError> {
     let compression: sdk::types::Compression = config
@@ -396,7 +403,7 @@ pub fn sdk_config(
         .map(Into::into)
         .unwrap_or(sdk::types::Compression::None);
 
-    let mut sdk_config = S2Config::new(access_token)
+    let mut sdk_config = authentication
         .with_user_agent(user_agent)
         .expect("valid user agent")
         .with_request_timeout(Duration::from_secs(30))

@@ -38,6 +38,18 @@ impl Backend {
         basin: BasinName,
         request: ListStreamsRequest,
     ) -> Result<Page<StreamInfo>, ListStreamsError> {
+        let mut authorization = self
+            .pki
+            .as_ref()
+            .map(|identity| {
+                identity.collection_authorizer(
+                    s2_common::access::Operation::ListStreams,
+                    Some(basin.as_ref()),
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            })
+            .transpose()
+            .map_err(super::error::StorageError::from)?;
         let ListStreamsRequest {
             prefix,
             start_after,
@@ -45,6 +57,17 @@ impl Backend {
         } = request;
 
         let key_range = kv::stream_meta::ser_key_range(&basin, &prefix, &start_after);
+        let key_range = if let Some(auth) = &authorization {
+            super::pki::intersect_list_range(key_range, auth.resource_scope(), |value| {
+                let prefix = value.parse::<s2_common::stream::StreamNamePrefix>().ok()?;
+                Some(
+                    kv::stream_meta::ser_key_prefix(&basin, &prefix)
+                        ..kv::stream_meta::ser_key_prefix_end(&basin, &prefix),
+                )
+            })
+        } else {
+            key_range
+        };
         if key_range.is_empty() {
             return Ok(Page::new_empty());
         }
@@ -62,6 +85,16 @@ impl Backend {
             assert_eq!(deser_basin.as_ref(), basin.as_ref());
             assert!(stream.as_ref() > start_after.as_ref());
             assert!(stream.as_ref() >= prefix.as_ref());
+            if let Some(auth) = &mut authorization
+                && !auth
+                    .authorize_candidate(
+                        stream.as_ref(),
+                        OffsetDateTime::now_utc().unix_timestamp(),
+                    )
+                    .map_err(super::error::StorageError::from)?
+            {
+                continue;
+            }
             if streams.len() == limit.as_usize() {
                 has_more = true;
                 break;
@@ -73,6 +106,10 @@ impl Backend {
                 deleted_at: meta.deleted_at,
                 cipher: meta.cipher,
             });
+        }
+        if let Some(auth) = &authorization {
+            auth.check_active(OffsetDateTime::now_utc().unix_timestamp())
+                .map_err(super::error::StorageError::from)?;
         }
         Ok(Page::new(streams, has_more))
     }
@@ -87,6 +124,11 @@ impl Backend {
         config: OptionalStreamConfig,
         mode: ProvisionMode,
     ) -> Result<ProvisionResult<StreamInfo>, ProvisionStreamError> {
+        self.authorize_provision_stream(
+            basin.as_ref(),
+            stream.as_ref(),
+            matches!(mode, ProvisionMode::Ensure),
+        )?;
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
         let Some(basin_meta) = db_txn_get(
@@ -112,6 +154,12 @@ impl Backend {
         })
         .await?
         .unzip();
+        let permission = if existing_meta.is_some() && matches!(mode, ProvisionMode::Ensure) {
+            s2_common::access::Operation::ReconfigureStream
+        } else {
+            s2_common::access::Operation::CreateStream
+        };
+        self.authorize(permission, Some(basin.as_ref()), Some(stream.as_ref()))?;
         if existing_meta
             .as_ref()
             .is_some_and(|meta| meta.deleted_at.is_some())
@@ -232,6 +280,11 @@ impl Backend {
         basin: BasinName,
         stream: StreamName,
     ) -> Result<StreamConfig, GetStreamConfigError> {
+        self.authorize(
+            s2_common::access::Operation::GetStreamConfig,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         let meta = self
             .db_get(
                 kv::stream_meta::ser_key(&basin, &stream),
@@ -254,6 +307,11 @@ impl Backend {
         stream: StreamName,
         reconfig: StreamReconfiguration,
     ) -> Result<StreamConfig, ReconfigureStreamError> {
+        self.authorize(
+            s2_common::access::Operation::ReconfigureStream,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         let txn = self.db.begin(IsolationLevel::SerializableSnapshot).await?;
 
         let meta_key = kv::stream_meta::ser_key(&basin, &stream);
@@ -340,6 +398,11 @@ impl Backend {
         basin: BasinName,
         stream: StreamName,
     ) -> Result<(), DeleteStreamError> {
+        self.authorize(
+            s2_common::access::Operation::DeleteStream,
+            Some(basin.as_ref()),
+            Some(stream.as_ref()),
+        )?;
         self.delete_stream_with_condition(basin, stream, TerminalTrimCondition::Always)
             .await
             .map(|_| ())

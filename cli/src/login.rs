@@ -66,6 +66,8 @@ type CallbackSender = Arc<Mutex<Option<oneshot::Sender<CallbackOutcome>>>>;
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum LoginError {
+    #[error("PKI: {0}")]
+    Pki(String),
     #[error("Invalid OAuth issuer: {0}")]
     InvalidIssuer(String),
 
@@ -265,7 +267,8 @@ impl LoginError {
 }
 
 pub struct ResolvedCredential {
-    access_token: SecretString,
+    access_token: Option<SecretString>,
+    pki: Option<s2_pki_auth::PkiCredentials>,
     source: TokenSource,
     oauth_session: Option<OAuthSession>,
     oauth_tokens: Option<TokenSet>,
@@ -279,8 +282,16 @@ enum CredentialChoice {
 }
 
 impl ResolvedCredential {
-    pub fn access_token(&self) -> &str {
-        self.access_token.expose_secret()
+    pub fn initial_sdk_config(&self) -> S2Config {
+        match &self.pki {
+            Some(credentials) => S2Config::new_pki(credentials.clone()),
+            None => S2Config::new(
+                self.access_token
+                    .as_ref()
+                    .expect("bearer credential has a token")
+                    .expose_secret(),
+            ),
+        }
     }
 
     pub fn source(&self) -> TokenSource {
@@ -288,6 +299,9 @@ impl ResolvedCredential {
     }
 
     pub fn validate_destination(&self, config: &CliConfig) -> Result<(), LoginError> {
+        if let Some(credentials) = &self.pki {
+            return crate::pki::validate_destination(credentials, config).map_err(LoginError::Pki);
+        }
         let Some(session) = self.oauth_session.as_ref() else {
             return Ok(());
         };
@@ -931,9 +945,11 @@ pub async fn logout(args: &LogoutArgs) -> Result<(), LoginError> {
 
     let reference = session.credential_reference();
     config.oauth = None;
-    config.auth_method = config
-        .has_stored_access_token()
-        .then_some(AuthMethod::AccessToken);
+    if config.auth_method != Some(AuthMethod::Pki) {
+        config.auth_method = config
+            .has_stored_access_token()
+            .then_some(AuthMethod::AccessToken);
+    }
     if !config.pending_oauth_cleanup.contains(&reference) {
         config.pending_oauth_cleanup.push(reference.clone());
     }
@@ -995,13 +1011,27 @@ pub async fn logout(args: &LogoutArgs) -> Result<(), LoginError> {
 
 pub async fn resolve_access_token() -> Result<(CliConfig, ResolvedCredential), LoginError> {
     let mut snapshot = load_cli_config()?;
+    if snapshot.auth_method == Some(AuthMethod::Pki) {
+        let credentials = crate::pki::load(&snapshot).map_err(LoginError::Pki)?;
+        return Ok((
+            snapshot,
+            ResolvedCredential {
+                access_token: None,
+                pki: Some(credentials),
+                source: TokenSource::Pki,
+                oauth_session: None,
+                oauth_tokens: None,
+            },
+        ));
+    }
     let environment_access_token = access_token_from_environment()?;
     if let Some(access_token) = environment_access_token {
         access_token::validate(&access_token)?;
         return Ok((
             snapshot,
             ResolvedCredential {
-                access_token: access_token.into(),
+                access_token: Some(access_token.into()),
+                pki: None,
                 source: TokenSource::Environment,
                 oauth_session: None,
                 oauth_tokens: None,
@@ -1037,14 +1067,16 @@ async fn resolve_persistent_access_token(
             let rejected_access_tokens = HashSet::new();
             let token_set = load_fresh_tokens(session, &rejected_access_tokens).await?;
             Ok(ResolvedCredential {
-                access_token: token_set.access_token.clone(),
+                access_token: Some(token_set.access_token.clone()),
+                pki: None,
                 source: TokenSource::BrowserLogin,
                 oauth_session: Some(session.clone()),
                 oauth_tokens: Some(token_set.clone()),
             })
         }
         CredentialChoice::StoredAccessToken => Ok(ResolvedCredential {
-            access_token: access_token::load(config)?,
+            access_token: Some(access_token::load(config)?),
+            pki: None,
             source: if config.stored_access_token.is_some() {
                 TokenSource::StoredAccessToken
             } else {
@@ -1057,7 +1089,8 @@ async fn resolve_persistent_access_token(
 }
 
 fn authentication_config_changed(previous: &CliConfig, latest: &CliConfig) -> bool {
-    previous.auth_method != latest.auth_method
+    previous.pki != latest.pki
+        || previous.auth_method != latest.auth_method
         || previous.oauth != latest.oauth
         || previous.stored_access_token != latest.stored_access_token
         || previous.access_token != latest.access_token

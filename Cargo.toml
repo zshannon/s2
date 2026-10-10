@@ -4,6 +4,7 @@ members = [
     "api",
     "cli",
     "common",
+    "pki-auth",
     "lite",
     "resource-spec",
     "sdk",

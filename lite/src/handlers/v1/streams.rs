@@ -12,7 +12,7 @@ use s2_common::{
     stream::{ListStreamsRequest, StreamName},
 };
 
-use crate::{backend::Backend, handlers::v1::error::ServiceError};
+use crate::{backend::Backend, handlers::v1::error::ServiceError, pki::AuthContext};
 
 pub fn router() -> axum::Router<Backend> {
     use axum::routing::{delete, get, patch, post, put};
@@ -60,8 +60,10 @@ pub struct ListArgs {
 ))]
 pub async fn list_streams(
     State(backend): State<Backend>,
+    auth: AuthContext,
     ListArgs { basin, request }: ListArgs,
 ) -> Result<Json<v1t::stream::ListStreamsResponse>, ServiceError> {
+    let backend = auth.scope(backend);
     let request: ListStreamsRequest = request.try_into()?;
     let Page { values, has_more } = backend.list_streams(basin, request).await?;
     Ok(Json(v1t::stream::ListStreamsResponse {
@@ -105,6 +107,7 @@ pub struct CreateArgs {
 ))]
 pub async fn create_stream(
     State(backend): State<Backend>,
+    auth: AuthContext,
     CreateArgs {
         request_token: HeaderOpt(request_token),
         basin,
@@ -118,6 +121,7 @@ pub async fn create_stream(
     ),
     ServiceError,
 > {
+    let backend = auth.scope(backend);
     let config: OptionalStreamConfig = request
         .config
         .map(TryInto::try_into)
@@ -177,8 +181,10 @@ pub struct GetConfigArgs {
 ))]
 pub async fn get_stream_config(
     State(backend): State<Backend>,
+    auth: AuthContext,
     GetConfigArgs { basin, stream }: GetConfigArgs,
 ) -> Result<Json<v1t::config::StreamConfig>, ServiceError> {
+    let backend = auth.scope(backend);
     Ok(Json(backend.get_stream_config(basin, stream).await?.into()))
 }
 
@@ -218,6 +224,7 @@ pub struct EnsureArgs {
 ))]
 pub async fn ensure_stream(
     State(backend): State<Backend>,
+    auth: AuthContext,
     EnsureArgs {
         basin,
         stream,
@@ -231,6 +238,7 @@ pub async fn ensure_stream(
     ),
     ServiceError,
 > {
+    let backend = auth.scope(backend);
     let config: OptionalStreamConfig = config
         .map(TryInto::try_into)
         .transpose()?
@@ -284,8 +292,10 @@ pub struct DeleteArgs {
 ))]
 pub async fn delete_stream(
     State(backend): State<Backend>,
+    auth: AuthContext,
     DeleteArgs { basin, stream }: DeleteArgs,
 ) -> Result<StatusCode, ServiceError> {
+    let backend = auth.scope(backend);
     backend.delete_stream(basin, stream).await?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -326,12 +336,14 @@ pub struct ReconfigureArgs {
 ))]
 pub async fn reconfigure_stream(
     State(backend): State<Backend>,
+    auth: AuthContext,
     ReconfigureArgs {
         basin,
         stream,
         reconfiguration,
     }: ReconfigureArgs,
 ) -> Result<Json<v1t::config::StreamConfig>, ServiceError> {
+    let backend = auth.scope(backend);
     let reconfiguration: StreamReconfiguration = reconfiguration.try_into()?;
     let config = backend
         .reconfigure_stream(basin, stream, reconfiguration)

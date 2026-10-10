@@ -22,6 +22,8 @@ use crate::backend::error::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error("Permission denied")]
+    PermissionDenied,
     #[error(transparent)]
     HeaderRejection(#[from] HeaderRejection),
     #[error(transparent)]
@@ -80,6 +82,9 @@ impl From<AppendRequestRejection> for ServiceError {
 impl ServiceError {
     pub fn to_response(&self) -> ErrorResponse {
         match self {
+            ServiceError::PermissionDenied => {
+                standard(ErrorCode::PermissionDenied, "Permission denied")
+            }
             ServiceError::HeaderRejection(e) => standard(ErrorCode::BadHeader, e.to_string()),
             ServiceError::PathRejection(e) => standard(ErrorCode::BadPath, e.body_text()),
             ServiceError::QueryRejection(e) => standard(ErrorCode::BadQuery, e.body_text()),
@@ -95,10 +100,10 @@ impl ServiceError {
             },
             ServiceError::Validation(e) => standard(ErrorCode::Invalid, e.to_string()),
             ServiceError::ListBasins(e) => match e {
-                ListBasinsError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ListBasinsError::Storage(e) => storage(e),
             },
             ServiceError::ProvisionBasin(e) => match e {
-                ProvisionBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ProvisionBasinError::Storage(e) => storage(e),
                 ProvisionBasinError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -110,13 +115,13 @@ impl ServiceError {
                 }
             },
             ServiceError::GetBasinConfig(e) => match e {
-                GetBasinConfigError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                GetBasinConfigError::Storage(e) => storage(e),
                 GetBasinConfigError::BasinNotFound(e) => {
                     standard(ErrorCode::BasinNotFound, e.to_string())
                 }
             },
             ServiceError::DeleteBasin(e) => match e {
-                DeleteBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                DeleteBasinError::Storage(e) => storage(e),
                 DeleteBasinError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -125,7 +130,7 @@ impl ServiceError {
                 }
             },
             ServiceError::ReconfigureBasin(e) => match e {
-                ReconfigureBasinError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ReconfigureBasinError::Storage(e) => storage(e),
                 ReconfigureBasinError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -137,10 +142,10 @@ impl ServiceError {
                 }
             },
             ServiceError::ListStreams(e) => match e {
-                ListStreamsError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ListStreamsError::Storage(e) => storage(e),
             },
             ServiceError::ProvisionStream(e) => match e {
-                ProvisionStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ProvisionStreamError::Storage(e) => storage(e),
                 ProvisionStreamError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -159,7 +164,7 @@ impl ServiceError {
                 ProvisionStreamError::Validation(e) => standard(ErrorCode::Invalid, e.to_string()),
             },
             ServiceError::GetStreamConfig(e) => match e {
-                GetStreamConfigError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                GetStreamConfigError::Storage(e) => storage(e),
                 GetStreamConfigError::StreamNotFound(e) => {
                     standard(ErrorCode::StreamNotFound, e.to_string())
                 }
@@ -168,7 +173,7 @@ impl ServiceError {
                 }
             },
             ServiceError::DeleteStream(e) => match e {
-                DeleteStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                DeleteStreamError::Storage(e) => storage(e),
                 DeleteStreamError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -185,7 +190,7 @@ impl ServiceError {
                 }
             },
             ServiceError::ReconfigureStream(e) => match e {
-                ReconfigureStreamError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ReconfigureStreamError::Storage(e) => storage(e),
                 ReconfigureStreamError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -206,7 +211,7 @@ impl ServiceError {
                 }
             },
             ServiceError::CheckTail(e) => match e {
-                CheckTailError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                CheckTailError::Storage(e) => storage(e),
                 CheckTailError::TransactionConflict(e) => {
                     standard(ErrorCode::TransactionConflict, e.to_string())
                 }
@@ -227,7 +232,7 @@ impl ServiceError {
                 }
             },
             ServiceError::Append(e) => match e {
-                AppendError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                AppendError::Storage(e) => storage(e),
                 AppendError::EncryptionSpecResolution(e) => {
                     standard(ErrorCode::BadHeader, e.to_string())
                 }
@@ -264,7 +269,7 @@ impl ServiceError {
                 AppendError::MaxSeqNum(e) => standard(ErrorCode::Invalid, e.to_string()),
             },
             ServiceError::Read(e) => match e {
-                ReadError::Storage(e) => standard(ErrorCode::Storage, e.to_string()),
+                ReadError::Storage(e) => storage(e),
                 ReadError::EncryptionSpecResolution(e) => {
                     standard(ErrorCode::BadHeader, e.to_string())
                 }
@@ -328,4 +333,17 @@ fn standard(code: ErrorCode, message: impl Into<String>) -> ErrorResponse {
             message: message.into(),
         },
     })
+}
+
+fn storage(e: &crate::backend::error::StorageError) -> ErrorResponse {
+    match e {
+        crate::backend::error::StorageError::ListWorkLimit => {
+            // Nonretryable; no scanned resource, count, partial page or cursor.
+            standard(ErrorCode::Invalid, "Listing work limit exceeded")
+        }
+        crate::backend::error::StorageError::PermissionDenied => {
+            standard(ErrorCode::PermissionDenied, "Permission denied")
+        }
+        e => standard(ErrorCode::Storage, e.to_string()),
+    }
 }

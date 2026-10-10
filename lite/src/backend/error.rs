@@ -12,12 +12,25 @@ use crate::backend::kv;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StorageError {
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("listing work limit exceeded")]
+    ListWorkLimit,
     #[error("invariant violation: {0}")]
     InvariantViolation(String),
     #[error("deserialization: {0}")]
     Deserialization(#[from] kv::DeserializationError),
     #[error("database: {0}")]
     Database(Arc<slatedb::Error>),
+}
+
+impl From<s2_pki_auth::AuthError> for StorageError {
+    fn from(error: s2_pki_auth::AuthError) -> Self {
+        match error {
+            s2_pki_auth::AuthError::ListWorkLimit => Self::ListWorkLimit,
+            _ => Self::PermissionDenied,
+        }
+    }
 }
 
 impl StorageError {

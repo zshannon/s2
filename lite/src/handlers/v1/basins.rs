@@ -11,7 +11,7 @@ use s2_common::{
     resources::{PROVISION_RESULT_HEADER, Page, ProvisionMode, ProvisionResult, RequestToken},
 };
 
-use crate::{backend::Backend, handlers::v1::error::ServiceError};
+use crate::{backend::Backend, handlers::v1::error::ServiceError, pki::AuthContext};
 
 pub fn router() -> axum::Router<Backend> {
     use axum::routing::{delete, get, patch, post, put};
@@ -46,8 +46,10 @@ pub struct ListArgs {
 ))]
 pub async fn list_basins(
     State(backend): State<Backend>,
+    auth: AuthContext,
     ListArgs { request }: ListArgs,
 ) -> Result<Json<v1t::basin::ListBasinsResponse>, ServiceError> {
+    let backend = auth.scope(backend);
     let request: ListBasinsRequest = request.try_into()?;
     let Page { values, has_more } = backend.list_basins(request).await?;
     Ok(Json(v1t::basin::ListBasinsResponse {
@@ -82,6 +84,7 @@ pub struct CreateArgs {
 ))]
 pub async fn create_basin(
     State(backend): State<Backend>,
+    auth: AuthContext,
     CreateArgs {
         request_token: HeaderOpt(request_token),
         request,
@@ -94,6 +97,7 @@ pub async fn create_basin(
     ),
     ServiceError,
 > {
+    let backend = auth.scope(backend);
     let config: BasinConfig = request
         .config
         .map(TryInto::try_into)
@@ -143,8 +147,10 @@ pub struct GetConfigArgs {
 ))]
 pub async fn get_basin_config(
     State(backend): State<Backend>,
+    auth: AuthContext,
     GetConfigArgs { basin }: GetConfigArgs,
 ) -> Result<Json<v1t::config::BasinConfig>, ServiceError> {
+    let backend = auth.scope(backend);
     let config = backend.get_basin_config(basin).await?;
     Ok(Json(config.into()))
 }
@@ -174,6 +180,7 @@ pub struct EnsureArgs {
 ))]
 pub async fn ensure_basin(
     State(backend): State<Backend>,
+    auth: AuthContext,
     EnsureArgs {
         basin,
         request: JsonOpt(request),
@@ -186,6 +193,7 @@ pub async fn ensure_basin(
     ),
     ServiceError,
 > {
+    let backend = auth.scope(backend);
     let config: BasinConfig = request
         .and_then(|req| req.config)
         .map(TryInto::try_into)
@@ -231,8 +239,10 @@ pub struct DeleteArgs {
 ))]
 pub async fn delete_basin(
     State(backend): State<Backend>,
+    auth: AuthContext,
     DeleteArgs { basin }: DeleteArgs,
 ) -> Result<StatusCode, ServiceError> {
+    let backend = auth.scope(backend);
     backend.delete_basin(basin).await?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -263,11 +273,13 @@ pub struct ReconfigureArgs {
 ))]
 pub async fn reconfigure_basin(
     State(backend): State<Backend>,
+    auth: AuthContext,
     ReconfigureArgs {
         basin,
         reconfiguration,
     }: ReconfigureArgs,
 ) -> Result<Json<v1t::config::BasinConfig>, ServiceError> {
+    let backend = auth.scope(backend);
     let reconfiguration: BasinReconfiguration = reconfiguration.try_into()?;
     let config = backend.reconfigure_basin(basin, reconfiguration).await?;
     Ok(Json(config.into()))

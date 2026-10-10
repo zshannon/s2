@@ -20,6 +20,7 @@ const KEYRING_SERVICE: &str = "s2-cli";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
+    Pki,
     AccessToken,
     OAuth,
 }
@@ -27,6 +28,7 @@ pub enum CredentialKind {
 impl CredentialKind {
     fn storage_key_prefix(self) -> &'static str {
         match self {
+            Self::Pki => "pki",
             Self::AccessToken => "access-token",
             Self::OAuth => "oauth",
         }

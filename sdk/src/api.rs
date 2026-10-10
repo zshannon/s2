@@ -84,10 +84,31 @@ impl AccountClient {
         client::uri_with_path(&self.base_url, path)
     }
 
+    pub async fn revoke_pki_grant(&self, grant: &s2_pki_auth::Grant) -> Result<(), ApiError> {
+        if self.client.pki_credentials.is_none() {
+            return Err(ClientError::Configuration(
+                "PKI credentials are required to revoke a grant".into(),
+            )
+            .into());
+        }
+        let request = self
+            .post(self.uri("v1/pki/revocations"))
+            .json(&serde_json::json!({"grant":grant.to_base64()}))
+            .build()?;
+        self.request(request).send().await?;
+        Ok(())
+    }
+
     pub async fn list_access_tokens(
         &self,
         request: ListAccessTokensRequest,
     ) -> Result<ListAccessTokensResponse, ApiError> {
+        if self.client.pki_credentials.is_some() {
+            return Err(ClientError::Configuration(
+                "Access-token management is unavailable in PKI mode".into(),
+            )
+            .into());
+        }
         let url = self.uri("v1/access-tokens");
         let request = self.get(url).query(&request).build()?;
         let response = self.request(request).send().await?;
@@ -98,6 +119,12 @@ impl AccountClient {
         &self,
         request: IssueAccessTokenRequest,
     ) -> Result<IssueAccessTokenResponse, ApiError> {
+        if self.client.pki_credentials.is_some() {
+            return Err(ClientError::Configuration(
+                "Access-token management is unavailable in PKI mode".into(),
+            )
+            .into());
+        }
         let url = self.uri("v1/access-tokens");
         let request = self.post(url).json(&request).build()?;
         let response = self.request(request).send().await?;
@@ -105,6 +132,12 @@ impl AccountClient {
     }
 
     pub async fn revoke_access_token(&self, id: AccessTokenId) -> Result<(), ApiError> {
+        if self.client.pki_credentials.is_some() {
+            return Err(ClientError::Configuration(
+                "Access-token management is unavailable in PKI mode".into(),
+            )
+            .into());
+        }
         let url = self.uri(format!("v1/access-tokens/{}", urlencoding::encode(&id)));
         let request = self.delete(url).build()?;
         let _response = self.request(request).send().await?;
@@ -793,6 +826,7 @@ pub struct BaseClient {
     client: Arc<dyn client::RequestExecutor>,
     default_headers: HeaderMap,
     access_token_mode: AccessTokenMode,
+    pki_credentials: Option<Arc<s2_pki_auth::PkiCredentials>>,
     #[cfg(feature = "_hidden")]
     access_token_provider: Option<Arc<dyn crate::types::AccessTokenProvider>>,
     request_timeout: Duration,
@@ -830,7 +864,9 @@ impl BaseClient {
         default_headers.remove(AUTHORIZATION);
         #[cfg(feature = "_hidden")]
         let mut access_token_provider = None;
+        let mut pki_credentials = None;
         match &config.access_token {
+            AccessToken::Pki(credentials) => pki_credentials = Some(credentials.clone()),
             AccessToken::Static(access_token) => {
                 default_headers.insert(
                     AUTHORIZATION,
@@ -865,6 +901,7 @@ impl BaseClient {
             client: Arc::new(client),
             default_headers,
             access_token_mode,
+            pki_credentials,
             #[cfg(feature = "_hidden")]
             access_token_provider,
             request_timeout: config.request_timeout,
@@ -906,39 +943,30 @@ impl BaseClient {
             .headers(&self.default_headers)
     }
 
-    pub async fn init_streaming(
-        &self,
-        request: client::Request,
-    ) -> Result<StreamingResponse, client::HttpError> {
-        self.client.init_streaming(request).await
-    }
-
-    #[cfg(not(feature = "_hidden"))]
     async fn init_streaming_authorized(
         &self,
         request: client::Request,
     ) -> Result<(StreamingResponse, Option<String>), ApiError> {
-        self.init_streaming(request)
-            .await
-            .map(|response| (response, None))
-            .map_err(ApiError::from)
-    }
-
-    #[cfg(feature = "_hidden")]
-    async fn init_streaming_authorized(
-        &self,
-        mut request: client::Request,
-    ) -> Result<(StreamingResponse, Option<String>), ApiError> {
+        let mut request = request;
         let access_token = self.authorize(&mut request).await?;
-        let response = self.init_streaming(request).await.map_err(ApiError::from)?;
+        let response = self
+            .client
+            .init_streaming(request)
+            .await
+            .map_err(ApiError::from)?;
         Ok((response, access_token))
     }
 
     async fn execute_unary(
         &self,
         mut request: client::Request,
+        frame_signal: Option<FrameSignal>,
     ) -> Result<(UnaryResponse, Option<String>), ApiError> {
+        request = request.compress().await.map_err(ApiError::from)?;
         let access_token = self.authorize(&mut request).await?;
+        if let Some(signal) = frame_signal {
+            request = request.with_monitored_body(signal);
+        }
         let response = self
             .client
             .execute_unary(request)
@@ -948,6 +976,12 @@ impl BaseClient {
     }
 
     async fn authorize(&self, _request: &mut client::Request) -> Result<Option<String>, ApiError> {
+        if let Some(credentials) = self.pki_credentials.as_ref() {
+            _request.sign_pki(credentials).map_err(|error| {
+                ClientError::Configuration(format!("PKI authentication: {error}"))
+            })?;
+            return Ok(None);
+        }
         #[cfg(feature = "_hidden")]
         if let Some(provider) = self.access_token_provider.as_ref() {
             let access_token = provider
@@ -1061,16 +1095,11 @@ impl<'a> RequestBuilder<'a> {
                 signal.reset();
             }
 
-            let attempt_request = {
-                let mut r = request.try_clone().expect("body should not be a stream");
-                if let Some(ref signal) = self.frame_signal {
-                    r = r.compress().await.map_err(ApiError::from)?;
-                    r = r.with_monitored_body(signal.clone());
-                }
-                r
-            };
-
-            let response = self.client.execute_unary(attempt_request).await;
+            let attempt_request = request.try_clone().expect("body should not be a stream");
+            let response = self
+                .client
+                .execute_unary(attempt_request, self.frame_signal.clone())
+                .await;
 
             let (err, retry_after, access_token) = match response {
                 Ok((resp, access_token)) => {
@@ -1360,6 +1389,186 @@ mod tests {
                 .push(request.headers_mut().clone());
             // Capturing initiation is sufficient: do not construct a response body.
             Err(client::HttpError::Timeout)
+        }
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn pki_signs_every_retry_without_a_bearer_token() {
+        use s2_common::access::Operation;
+        use s2_pki_auth::*;
+        let issuer = ClientKey::generate();
+        let key = ClientKey::generate();
+        let grant = issue_grant(
+            &issuer,
+            &key.public_key(),
+            "http://example.test",
+            &GrantScope::new(
+                ResourceScope::Any,
+                ResourceScope::Any,
+                vec![Operation::ListBasins],
+            ),
+            2_000_000_000,
+        )
+        .unwrap();
+        let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap())
+            .with_endpoints(S2Endpoints::for_endpoint("http://example.test").unwrap());
+        let executor = Arc::new(HeaderCapture::default());
+        let mut base = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
+        base.client = executor.clone();
+        base.retry_builder = RetryBackoffBuilder::default()
+            .with_min_base_delay(Duration::ZERO)
+            .with_max_base_delay(Duration::ZERO)
+            .with_max_retries(1);
+        let account = AccountClient::init(config, base);
+        account
+            .list_basins(ListBasinsRequest {
+                prefix: None,
+                start_after: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let requests = executor.unary.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            requests[0]["signature-input"],
+            requests[1]["signature-input"]
+        );
+        for headers in requests.iter() {
+            assert!(
+                headers[AUTHORIZATION]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("Biscuit ")
+            );
+            verify_request(
+                &TrustedIssuers::new(vec![issuer.public_key()]),
+                "http://example.test",
+                &http::Method::GET,
+                &"http://example.test/v1/basins".parse().unwrap(),
+                headers,
+                RequestBody::Unary(b""),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn monitored_unary_append_is_signed_as_unary_after_compression() {
+        use s2_common::access::Operation;
+        use s2_pki_auth::*;
+        let issuer = ClientKey::generate();
+        let key = ClientKey::generate();
+        let grant = issue_grant(
+            &issuer,
+            &key.public_key(),
+            "http://example.test",
+            &GrantScope::new(
+                ResourceScope::Any,
+                ResourceScope::Any,
+                vec![Operation::Append],
+            ),
+            2_000_000_000,
+        )
+        .unwrap();
+        let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap())
+            .with_compression(Compression::Gzip);
+        let mut base = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
+        let executor = Arc::new(HeaderCapture::default());
+        base.client = executor.clone();
+        let request = base
+            .post(
+                "http://example.test/v1/streams/events/records"
+                    .parse()
+                    .unwrap(),
+            )
+            .json(&serde_json::json!({"records":[]}))
+            .build()
+            .unwrap();
+        let _ = base
+            .request(request)
+            .with_append_retry_policy(AppendRetryPolicy::NoSideEffects)
+            .send()
+            .await;
+        let captured = executor.unary.lock().unwrap();
+        assert!(!captured.is_empty());
+        assert_eq!(captured[0]["s2-pki-body"], "unary");
+        assert!(captured[0].contains_key("content-digest"));
+        assert_eq!(captured[0][http::header::CONTENT_ENCODING], "gzip");
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn pki_streaming_authenticates_independently_of_transport_options() {
+        use s2_pki_auth::*;
+        for origin in [
+            "http://remote.example",
+            "http://localhost",
+            "https://remote.example",
+        ] {
+            let issuer = ClientKey::generate();
+            let key = ClientKey::generate();
+            let grant = issue_grant(
+                &issuer,
+                &key.public_key(),
+                origin,
+                &GrantScope::new(
+                    ResourceScope::Any,
+                    ResourceScope::Any,
+                    vec![Operation::Read, Operation::Append],
+                ),
+                2_000_000_000,
+            )
+            .unwrap();
+            let config = S2Config::new_pki(PkiCredentials::new(key, grant).unwrap())
+                .with_insecure_skip_cert_verification(true);
+            let mut base = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
+            let executor = Arc::new(HeaderCapture::default());
+            base.client = executor.clone();
+            for append in [false, true] {
+                let uri = format!("{origin}/v1/streams/events/records")
+                    .parse()
+                    .unwrap();
+                let request = if append {
+                    base.post(uri)
+                        .header("content-type", "s2s/proto")
+                        .body(client::Body::wrap_stream(futures_util::stream::empty::<
+                            std::result::Result<bytes::Bytes, std::io::Error>,
+                        >()))
+                        .build()
+                        .unwrap()
+                } else {
+                    base.get(uri)
+                        .header("accept", "text/event-stream")
+                        .build()
+                        .unwrap()
+                };
+                let _ = base.init_streaming_authorized(request).await;
+            }
+            let requests = executor.streaming.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for (index, headers) in requests.iter().enumerate() {
+                let (method, body) = if index == 0 {
+                    (http::Method::GET, RequestBody::Unary(b""))
+                } else {
+                    (http::Method::POST, RequestBody::Streaming)
+                };
+                verify_request(
+                    &TrustedIssuers::new(vec![issuer.public_key()]),
+                    origin,
+                    &method,
+                    &format!("{origin}/v1/streams/events/records")
+                        .parse()
+                        .unwrap(),
+                    headers,
+                    body,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -1826,6 +2035,7 @@ mod tests {
         let client = BaseClient {
             client: executor.clone(),
             default_headers: HeaderMap::new(),
+            pki_credentials: None,
             access_token_mode: AccessTokenMode::Refreshable,
             access_token_provider: Some(provider.clone()),
             request_timeout: Duration::from_secs(1),

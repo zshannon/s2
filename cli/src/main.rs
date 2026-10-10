@@ -1,5 +1,7 @@
 //! S2 command-line interface.
 
+mod pki;
+
 mod access_token;
 mod apply;
 mod auth;
@@ -248,12 +250,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 
     if let Command::Auth(auth_cmd) = &command {
         match auth_cmd {
+            AuthCommand::Pki(command) => pki::run(command).await?,
             AuthCommand::Login(args) => login::login(args).await?,
             AuthCommand::Logout(args) => login::logout(args).await?,
             AuthCommand::Status => return auth::status().await,
             AuthCommand::Use { method } => {
                 let saved_path = select_auth_method(*method).await?;
                 let message = match method {
+                    AuthMethod::Pki => "✓ PKI selected",
                     AuthMethod::AccessToken => "✓ Access token selected",
                     AuthMethod::BrowserLogin => "✓ Browser login selected",
                 };
@@ -262,7 +266,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     "  - Configuration saved to: {}",
                     saved_path.display().to_string().cyan()
                 );
-                if login::has_access_token_environment_variable() {
+                if *method != AuthMethod::Pki && login::has_access_token_environment_variable() {
                     eprintln!(
                         "{}",
                         "  - Warning: S2_ACCESS_TOKEN is set and remains active. Unset it to use the selected credential."
@@ -368,7 +372,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     credential.validate_destination(&cli_config)?;
     let sdk_config = credential.configure_sdk(sdk_config(
         &cli_config,
-        credential.access_token(),
+        credential.initial_sdk_config(),
         update::user_agent(),
     )?);
     let token_source = Some(credential.source());

@@ -1,0 +1,59 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: "0 9 * * 2"
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  open-pull-request:
+    if: github.repository == 'zshannon/s2' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or reuse upstream pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const base = 'main';
+            const head = 's2-streamstore:main';
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${head}`, per_page: 1,
+            });
+            if (comparison.data.ahead_by === 0) {
+              core.info('No upstream commits need merging.');
+              return;
+            }
+
+            const open = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', base, head, per_page: 100,
+            });
+            const existing = open.find(pr => pr.head.repo?.full_name === 's2-streamstore/s2');
+            if (existing) {
+              core.info(`Upstream pull request already open: ${existing.html_url}`);
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo, base, head,
+              title: 'chore(upstream): merge upstream main',
+              body: [
+                'Merge the latest `s2-streamstore/s2:main` changes into this fork.',
+                '',
+                'Opened by the Tuesday 09:00 America/Los_Angeles sync. This PR tracks upstream main directly and is reused while open; the workflow never resets main or merges automatically.',
+                '',
+                'Use a merge commit to retain upstream ancestry, so later syncs contain only new upstream commits. Resolve any conflicts against the fork before merging.',
+              ].join('\n'),
+              maintainer_can_modify: false,
+            });
+            core.info(`Opened upstream pull request: ${pr.html_url}`);

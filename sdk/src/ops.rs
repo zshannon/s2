@@ -228,6 +228,15 @@ impl S2 {
         Ok(response.access_token)
     }
 
+    /// Revoke a PKI grant and all descendants containing its block identifier.
+    /// Requires the issuer's key or a holder in the target's delegation ancestry.
+    pub async fn revoke_pki_grant(&self, grant: &s2_pki_auth::Grant) -> Result<(), RequestError> {
+        self.client
+            .revoke_pki_grant(grant)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Revoke an access token.
     pub async fn revoke_access_token(&self, id: AccessTokenId) -> Result<(), RequestError> {
         Ok(self.client.revoke_access_token(id).await?)
