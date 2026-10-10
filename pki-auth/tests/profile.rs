@@ -120,9 +120,44 @@ fn external_block(
         .unwrap()
     };
     let token = Biscuit::from(&**parent, public(parent.issuer())).unwrap();
-    let payload=serde_json::to_vec(&serde_json::json!({"version":2,"client":recipient,"audience":"http://localhost","scope":scope,"expires":expiry,"parent":token.revocation_identifiers()[0]})).unwrap();
+    // Build native facts/checks independently of delegation validation, allowing
+    // tests to sign an otherwise well-formed block with widened permissions.
+    let template = issue_grant(holder, recipient, "http://localhost", scope, expiry).unwrap();
+    let template = Biscuit::from(&*template, public(&holder.public_key())).unwrap();
+    let index = token.block_count();
     let mut block = BlockBuilder::new()
-        .fact(fact("pki_grant", &[int(1), bytes(&payload)]))
+        .code(template.print_block_source(0).unwrap())
+        .unwrap();
+    for f in &mut block.facts {
+        f.predicate.terms[0] = int(index as i64);
+    }
+    for check in &mut block.checks {
+        for query in &mut check.queries {
+            for predicate in &mut query.body {
+                if predicate.name.starts_with("pki_") {
+                    predicate.terms[0] = int(index as i64);
+                }
+            }
+        }
+    }
+    block = block
+        .fact(fact(
+            "pki_parent",
+            &[
+                int(index as i64),
+                bytes(
+                    verify_biscuit(
+                        parent,
+                        &TrustedIssuers::new(vec![parent.issuer().clone()]),
+                        "http://localhost",
+                    )
+                    .unwrap()
+                    .revocation_identifiers()
+                    .last()
+                    .unwrap(),
+                ),
+            ],
+        ))
         .unwrap();
     if let Some(check) = check {
         block = block.code(check).unwrap();
@@ -144,7 +179,7 @@ fn external_block(
         .unwrap()
 }
 #[test]
-fn verifier_rejects_widened_claims_even_if_the_holder_signs_them_directly() {
+fn verifier_rejects_widened_facts_even_if_the_holder_signs_them_directly() {
     let issuer = ClientKey::generate();
     let alice = ClientKey::generate();
     let bob = ClientKey::generate();
@@ -199,7 +234,7 @@ fn verifier_rejects_widened_claims_even_if_the_holder_signs_them_directly() {
     );
 }
 #[test]
-fn signed_biscuit_checks_are_evaluated_in_addition_to_structured_scope() {
+fn additional_biscuit_checks_are_evaluated_with_native_scope_checks() {
     let issuer = ClientKey::generate();
     let alice = ClientKey::generate();
     let bob = ClientKey::generate();
@@ -246,4 +281,185 @@ fn signed_biscuit_checks_are_evaluated_in_addition_to_structured_scope() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn delegation_cannot_assert_or_derive_server_request_facts() {
+    let issuer = ClientKey::generate();
+    let alice = ClientKey::generate();
+    let bob = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let root = issue_grant(
+        &issuer,
+        &alice.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let trusted = TrustedIssuers::new(vec![issuer.public_key()]);
+    for injection in [
+        "operation(\"Read\");",
+        "time(0);",
+        "audience(\"http://localhost\");",
+        "basin(\"logs\");",
+        "stream(\"events\");",
+        "basin_present(false);",
+        "stream_present(false);",
+        "operation(\"Read\") <- true;",
+        "time(0) <- true;",
+        "pki_operation(1, \"Append\") <- true;",
+    ] {
+        let child = external_block(
+            &root,
+            &alice,
+            &bob.public_key(),
+            &scope,
+            1_999_999_000,
+            Some(injection),
+        );
+        assert!(
+            matches!(
+                verify_biscuit(&child, &trusted, "http://localhost"),
+                Err(AuthError::InvalidGrant)
+            ),
+            "accepted {injection}"
+        );
+    }
+}
+
+#[test]
+fn repeated_holder_blocks_cannot_inject_metadata_for_an_earlier_index() {
+    let issuer = ClientKey::generate();
+    let alice = ClientKey::generate();
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let root = issue_grant(
+        &issuer,
+        &alice.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let restricted = restrict_grant(&root, &alice, &scope, 1_999_999_000).unwrap();
+    let trusted = TrustedIssuers::new(vec![issuer.public_key()]);
+    let valid = external_block(
+        &restricted,
+        &alice,
+        &alice.public_key(),
+        &scope,
+        1_999_998_000,
+        None,
+    );
+    let verified = verify_biscuit(&valid, &trusted, "http://localhost").unwrap();
+    assert_eq!(verified.revocation_identifiers().len(), 3);
+    assert!(
+        authorize_operation(
+            &verified,
+            Operation::Read,
+            Some("logs"),
+            Some("events"),
+            1_900_000_000
+        )
+        .is_ok()
+    );
+    for injection in [
+        "pki_expires(1, 2000000000);",
+        "pki_operation(0, \"Append\");",
+        "pki_expires(2, 2000000000);",
+    ] {
+        let child = external_block(
+            &restricted,
+            &alice,
+            &alice.public_key(),
+            &scope,
+            1_999_998_000,
+            Some(injection),
+        );
+        assert!(
+            matches!(
+                verify_biscuit(&child, &trusted, "http://localhost"),
+                Err(AuthError::InvalidGrant)
+            ),
+            "accepted {injection}"
+        );
+    }
+}
+
+#[test]
+fn delegation_must_retain_every_native_profile_check() {
+    use biscuit_auth::{
+        Biscuit, PrivateKey, PublicKey,
+        builder::{Algorithm, BlockBuilder, int, var},
+    };
+    let issuer = ClientKey::generate();
+    let alice = ClientKey::generate();
+    let bob = ClientKey::generate();
+    let public = |key: &ClientPublicKey| {
+        PublicKey::from_bytes(
+            &bs58::decode(key.to_base58()).into_vec().unwrap(),
+            Algorithm::Secp256r1,
+        )
+        .unwrap()
+    };
+    let scope = GrantScope::new(
+        ResourceScope::Any,
+        ResourceScope::Any,
+        vec![Operation::Read],
+    );
+    let root = issue_grant(
+        &issuer,
+        &alice.public_key(),
+        "http://localhost",
+        &scope,
+        2_000_000_000,
+    )
+    .unwrap();
+    let valid = delegate_grant(&root, &alice, &bob.public_key(), &scope, 1_999_999_000).unwrap();
+    let token = Biscuit::from(&*root, public(&issuer.public_key())).unwrap();
+    let valid = Biscuit::from(&*valid, public(&issuer.public_key())).unwrap();
+    let template = BlockBuilder::new()
+        .code(valid.print_block_source(1).unwrap())
+        .unwrap();
+    let key = PrivateKey::from_bytes(
+        &bs58::decode(alice.to_base58()).into_vec().unwrap(),
+        Algorithm::Secp256r1,
+    )
+    .unwrap();
+    let trusted = TrustedIssuers::new(vec![issuer.public_key()]);
+    let verify = |block| {
+        let response = token
+            .third_party_request()
+            .unwrap()
+            .create_block(&key, block)
+            .unwrap();
+        let child = token
+            .append_third_party(public(&alice.public_key()), response)
+            .unwrap();
+        verify_biscuit(&child.to_vec().unwrap(), &trusted, "http://localhost")
+    };
+    for index in 0..template.checks.len() {
+        let mut block = template.clone();
+        block.checks.remove(index);
+        assert!(matches!(verify(block), Err(AuthError::InvalidGrant)));
+    }
+    let mut block = template.clone();
+    // The printed representation looks identical to the required operation
+    // check, but the AST contains just one predicate and a forged variable name.
+    // Validation must compare authenticated structure, never formatted source.
+    let query = &mut block.checks[0].queries[0];
+    query.body.truncate(1);
+    query.body[0].terms = vec![var("op), pki_operation(1, $op")];
+    assert!(matches!(verify(block), Err(AuthError::InvalidGrant)));
+    let mut block = template;
+    block.checks[0].queries[0].body[1].terms[0] = int(0);
+    assert!(matches!(verify(block), Err(AuthError::InvalidGrant)));
 }

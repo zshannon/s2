@@ -3,7 +3,12 @@ use std::{ops::Deref, time::Duration};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use biscuit_auth::{
     AuthorizerLimits, Biscuit,
-    builder::{AuthorizerBuilder, BiscuitBuilder, BlockBuilder, bytes, fact, int, string},
+    builder::{
+        AuthorizerBuilder, BiscuitBuilder, BlockBuilder, Check, Convert, Fact, Rule, Scope, Term,
+        boolean, bytes, fact, int, string,
+    },
+    datalog::SymbolTable,
+    format::convert::proto_snapshot_block_to_token_block,
 };
 use s2_common::access::Operation;
 use serde::{Deserialize, Serialize};
@@ -103,10 +108,10 @@ impl Grant {
         &self.issuer
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Claims {
-    version: u8,
+// Metadata is read from the literal facts of each authenticated block. It is
+// used for identity/delegation validation and inspection, never permission evaluation.
+#[derive(Clone, Debug)]
+struct BlockMetadata {
     client: ClientPublicKey,
     audience: String,
     scope: GrantScope,
@@ -118,32 +123,38 @@ pub struct VerifiedCapability {
     issuer: ClientPublicKey,
     holders: Vec<ClientPublicKey>,
     biscuit: Biscuit,
-    claims: Claims,
+    metadata: BlockMetadata,
+    blocks: Vec<BlockBuilder>,
     revocation_ids: Vec<Vec<u8>>,
 }
 impl std::fmt::Debug for VerifiedCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifiedCapability")
-            .field("client", &self.claims.client)
-            .field("expires", &self.claims.expires)
+            .field("client", &self.metadata.client)
+            .field("expires", &self.metadata.expires)
             .finish_non_exhaustive()
     }
 }
 impl VerifiedCapability {
     pub fn client_public_key(&self) -> &ClientPublicKey {
-        &self.claims.client
+        &self.metadata.client
     }
     pub fn expires_at(&self) -> i64 {
-        self.claims.expires
+        self.metadata.expires
     }
     pub fn scope(&self) -> &GrantScope {
-        &self.claims.scope
+        &self.metadata.scope
     }
     pub fn audience(&self) -> &str {
-        &self.claims.audience
+        &self.metadata.audience
     }
+    /// Stable S2 block IDs: low-S DER for P-256, raw signature bytes for Ed25519.
     pub fn revocation_identifiers(&self) -> &[Vec<u8>] {
         &self.revocation_ids
+    }
+    /// Native Datalog source of each authenticated block, in delegation order.
+    pub fn datalog_blocks(&self) -> Result<Vec<String>> {
+        datalog_sources(&self.biscuit)
     }
 }
 fn limits() -> AuthorizerLimits {
@@ -153,32 +164,378 @@ fn limits() -> AuthorizerLimits {
         max_time: Duration::from_millis(100),
     }
 }
-fn claims(biscuit: &Biscuit, index: usize, origin: &str) -> Result<Claims> {
-    let mut a = AuthorizerBuilder::new()
-        .set_limits(limits())
-        .build(biscuit)?;
-    let query = format!("data($p) <- pki_grant({index}, $p) trusting {origin}");
-    let (data,): (Vec<u8>,) = a.query_exactly_one(query.as_str())?;
-    let claims: Claims = serde_json::from_slice(&data)?;
-    if claims.version != 2
-        || claims.expires <= 0
-        || claims.scope.operations.is_empty()
-        || claims
-            .scope
-            .operations
+// These are the S2 operations available in PKI mode. Token management is excluded.
+const OPERATIONS: [Operation; 21] = [
+    Operation::ListBasins,
+    Operation::CreateBasin,
+    Operation::DeleteBasin,
+    Operation::ReconfigureBasin,
+    Operation::GetBasinConfig,
+    Operation::ListStreams,
+    Operation::CreateStream,
+    Operation::DeleteStream,
+    Operation::GetStreamConfig,
+    Operation::ReconfigureStream,
+    Operation::CheckTail,
+    Operation::Append,
+    Operation::Read,
+    Operation::Trim,
+    Operation::Fence,
+    Operation::AccountMetrics,
+    Operation::BasinMetrics,
+    Operation::StreamMetrics,
+    Operation::ListLocations,
+    Operation::GetDefaultLocation,
+    Operation::SetDefaultLocation,
+];
+const ALLOW_POLICY: &str = "allow if operation($op), pki_operation(0, $op) trusting authority;";
+
+fn ambient_predicate(name: &str) -> bool {
+    matches!(
+        name,
+        "time" | "operation" | "audience" | "basin" | "stream" | "basin_present" | "stream_present"
+    )
+}
+
+// Explicit authority scopes prevent a block-level `trusting previous` or a
+// future block signed by the same holder from changing these checks' origins.
+// The current block and authorizer are always included by Biscuit.
+fn required_checks(index: usize) -> Result<BlockBuilder> {
+    let mut block = BlockBuilder::new().code(format!(
+        r#"
+        check if operation($op), pki_operation({index}, $op) trusting authority;
+        check if audience($a), pki_audience({index}, $a) trusting authority;
+        check if time($now), pki_expires({index}, $expiry), $now < $expiry trusting authority;
+        check if basin_present(false) trusting authority
+            or basin($b), pki_basin({index}, "any", "") trusting authority
+            or basin($b), pki_basin({index}, "exact", $b) trusting authority
+            or basin($b), pki_basin({index}, "prefix", $p), $b.starts_with($p) trusting authority;
+        check if stream_present(false) trusting authority
+            or stream($s), pki_stream({index}, "any", "") trusting authority
+            or stream($s), pki_stream({index}, "exact", $s) trusting authority
+            or stream($s), pki_stream({index}, "prefix", $p), $s.starts_with($p) trusting authority;
+    "#
+    ))?;
+    // Normalize parser-only parameter maps for structural comparison with the
+    // authenticated AST. These checks contain no substitution parameters.
+    for check in &mut block.checks {
+        for query in &mut check.queries {
+            query.parameters = None;
+            query.scope_parameters = None;
+        }
+    }
+    Ok(block)
+}
+
+fn scope_terms(scope: &ResourceScope) -> [Term; 2] {
+    let (kind, value) = match scope {
+        ResourceScope::None => ("none", ""),
+        ResourceScope::Any => ("any", ""),
+        ResourceScope::Exact(v) => ("exact", v.as_str()),
+        ResourceScope::Prefix(v) => ("prefix", v.as_str()),
+    };
+    [string(kind), string(value)]
+}
+
+fn native_block(index: usize, metadata: &BlockMetadata) -> Result<BlockBuilder> {
+    let i = int(index as i64);
+    let mut block = required_checks(index)?
+        .fact(fact("pki_version", &[i.clone(), int(2)]))?
+        .fact(fact(
+            "pki_holder",
+            &[i.clone(), string(metadata.client.to_base58())],
+        ))?
+        .fact(fact(
+            "pki_audience",
+            &[i.clone(), string(&metadata.audience)],
+        ))?
+        .fact(fact("pki_expires", &[i.clone(), int(metadata.expires)]))?;
+    for (name, scope) in [
+        ("pki_basin", &metadata.scope.basins),
+        ("pki_stream", &metadata.scope.streams),
+    ] {
+        let [kind, value] = scope_terms(scope);
+        block = block.fact(fact(name, &[i.clone(), kind, value]))?;
+    }
+    if metadata.scope.operations.is_empty() {
+        return Err(AuthError::InvalidGrant);
+    }
+    for id in &metadata.scope.operations {
+        let operation = OPERATIONS
             .iter()
-            .any(|o| *o == 0 || *o > 24 || [6, 7, 8].contains(o))
+            .find(|op| **op as u8 == *id)
+            .ok_or(AuthError::InvalidGrant)?;
+        block = block.fact(fact(
+            "pki_operation",
+            &[i.clone(), string(&format!("{operation:?}"))],
+        ))?;
+    }
+    if let Some(parent) = &metadata.parent {
+        block = block.fact(fact("pki_parent", &[i, bytes(parent)]))?;
+    }
+    Ok(block)
+}
+
+fn one_fact<'a>(block: &'a BlockBuilder, name: &str) -> Result<&'a [Term]> {
+    let mut matches = block.facts.iter().filter(|f| f.predicate.name == name);
+    let terms = &matches
+        .next()
+        .ok_or(AuthError::InvalidGrant)?
+        .predicate
+        .terms;
+    if matches.next().is_some() {
+        return Err(AuthError::InvalidGrant);
+    }
+    Ok(&terms[1..])
+}
+fn read_scope(terms: &[Term]) -> Result<ResourceScope> {
+    match terms {
+        [Term::Str(kind), Term::Str(value)] => match (kind.as_str(), value.as_str()) {
+            ("none", "") => Ok(ResourceScope::None),
+            ("any", "") => Ok(ResourceScope::Any),
+            ("exact", _) => Ok(ResourceScope::Exact(value.clone())),
+            ("prefix", _) => Ok(ResourceScope::Prefix(value.clone())),
+            _ => Err(AuthError::InvalidGrant),
+        },
+        _ => Err(AuthError::InvalidGrant),
+    }
+}
+
+fn native_world(biscuit: &Biscuit) -> Result<biscuit_auth::format::schema::AuthorizerWorld> {
+    Ok(AuthorizerBuilder::new()
+        .set_limits(limits())
+        .build(biscuit)?
+        .snapshot()
+        .map_err(biscuit_auth::error::Token::from)?
+        .world)
+}
+fn world_symbols(world: &biscuit_auth::format::schema::AuthorizerWorld) -> Result<SymbolTable> {
+    let keys = world
+        .public_keys
+        .iter()
+        .map(biscuit_auth::PublicKey::from_proto)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(biscuit_auth::error::Token::from)?;
+    Ok(
+        SymbolTable::from_symbols_and_public_keys(world.symbols.clone(), keys)
+            .map_err(biscuit_auth::error::Token::from)?,
+    )
+}
+fn datalog_sources(biscuit: &Biscuit) -> Result<Vec<String>> {
+    // Escape the display symbol table only. The authorizer and metadata reader
+    // always consume the original structured values.
+    let mut world = native_world(biscuit)?;
+    for symbol in &mut world.symbols {
+        *symbol = symbol
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+    }
+    let symbols = world_symbols(&world)?;
+    world
+        .blocks
+        .iter()
+        .map(
+            |source| -> std::result::Result<String, biscuit_auth::error::Token> {
+                let native = proto_snapshot_block_to_token_block(source)?;
+                let mut lines = Vec::new();
+                if !native.scopes.is_empty() {
+                    let scopes = native
+                        .scopes
+                        .iter()
+                        .map(|s| Scope::convert_from(s, &symbols))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    lines.push(format!(
+                        "trusting {};",
+                        scopes
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                lines.extend(
+                    native
+                        .facts
+                        .iter()
+                        .map(|f| format!("{};", symbols.print_fact(f))),
+                );
+                lines.extend(
+                    native
+                        .rules
+                        .iter()
+                        .map(|r| format!("{};", symbols.print_rule(r))),
+                );
+                lines.extend(
+                    native
+                        .checks
+                        .iter()
+                        .map(|c| format!("{};", symbols.print_check(c))),
+                );
+                Ok(lines.join("\n"))
+            },
+        )
+        .collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+fn literal_blocks(biscuit: &Biscuit) -> Result<Vec<BlockBuilder>> {
+    // A structured snapshot exposes each block's literal AST without running
+    // rules or losing its origin. Never parse print_block_source: display text
+    // in biscuit-auth 6 does not escape string values.
+    let world = native_world(biscuit)?;
+    let symbols = world_symbols(&world)?;
+    world
+        .blocks
+        .iter()
+        .map(
+            |source| -> std::result::Result<BlockBuilder, biscuit_auth::error::Token> {
+                let native = proto_snapshot_block_to_token_block(source)?;
+                let mut block = BlockBuilder::new();
+                for f in native.facts {
+                    block = block.fact(Fact::convert_from(&f, &symbols)?)?;
+                }
+                for r in native.rules {
+                    block = block.rule(Rule::convert_from(&r, &symbols)?)?;
+                }
+                for c in native.checks {
+                    block = block.check(Check::convert_from(&c, &symbols)?)?;
+                }
+                for scope in native.scopes {
+                    block = block.scope(Scope::convert_from(&scope, &symbols)?);
+                }
+                Ok(block)
+            },
+        )
+        .collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
+fn read_block(block: &BlockBuilder, index: usize) -> Result<BlockMetadata> {
+    for f in &block.facts {
+        let name = f.predicate.name.as_str();
+        if ambient_predicate(name) {
+            return Err(AuthError::InvalidGrant);
+        }
+        if name.starts_with("pki_")
+            && (!matches!(
+                name,
+                "pki_version"
+                    | "pki_holder"
+                    | "pki_audience"
+                    | "pki_expires"
+                    | "pki_basin"
+                    | "pki_stream"
+                    | "pki_operation"
+                    | "pki_parent"
+            ) || f.predicate.terms.first() != Some(&int(index as i64)))
+        {
+            return Err(AuthError::InvalidGrant);
+        }
+    }
+    if block
+        .rules
+        .iter()
+        .any(|r| r.head.name.starts_with("pki_") || ambient_predicate(&r.head.name))
     {
         return Err(AuthError::InvalidGrant);
     }
-    claims.client.verifying_key()?;
-    Ok(claims)
+    if required_checks(index)?
+        .checks
+        .iter()
+        .any(|c| !block.checks.contains(c))
+    {
+        return Err(AuthError::InvalidGrant);
+    }
+    if one_fact(block, "pki_version")? != [int(2)] {
+        return Err(AuthError::InvalidGrant);
+    }
+    let [Term::Str(holder)] = one_fact(block, "pki_holder")? else {
+        return Err(AuthError::InvalidGrant);
+    };
+    let client = ClientPublicKey::from_base58(holder)?;
+    let [Term::Str(audience)] = one_fact(block, "pki_audience")? else {
+        return Err(AuthError::InvalidGrant);
+    };
+    let [Term::Integer(expires)] = one_fact(block, "pki_expires")? else {
+        return Err(AuthError::InvalidGrant);
+    };
+    if audience.is_empty() || *expires <= 0 {
+        return Err(AuthError::InvalidGrant);
+    }
+    let mut operations = Vec::new();
+    for f in block
+        .facts
+        .iter()
+        .filter(|f| f.predicate.name == "pki_operation")
+    {
+        let [_, Term::Str(name)] = f.predicate.terms.as_slice() else {
+            return Err(AuthError::InvalidGrant);
+        };
+        let op = OPERATIONS
+            .iter()
+            .find(|op| format!("{op:?}") == *name)
+            .ok_or(AuthError::InvalidGrant)?;
+        operations.push(*op as u8);
+    }
+    if operations.is_empty() {
+        return Err(AuthError::InvalidGrant);
+    }
+    let parent = if block.facts.iter().any(|f| f.predicate.name == "pki_parent") {
+        let [Term::Bytes(parent)] = one_fact(block, "pki_parent")? else {
+            return Err(AuthError::InvalidGrant);
+        };
+        Some(parent.clone())
+    } else {
+        None
+    };
+    let metadata = BlockMetadata {
+        client,
+        audience: audience.clone(),
+        expires: *expires,
+        parent,
+        scope: GrantScope {
+            basins: read_scope(one_fact(block, "pki_basin")?)?,
+            streams: read_scope(one_fact(block, "pki_stream")?)?,
+            operations,
+        },
+    };
+    Ok(metadata)
 }
 pub fn decode_grant(value: &str) -> Result<Vec<u8>> {
     if value.len() > MAX_GRANT_BYTES * 2 {
         return Err(AuthError::InvalidGrant);
     }
     Base64UrlUnpadded::decode_vec(value).map_err(|_| AuthError::InvalidGrant)
+}
+// Biscuit exposes raw internal signature bytes as revocation identifiers.
+// ECDSA has two equivalent S representations, so raw DER is not a stable ID.
+// Normalize the identifier only; retain the original token bytes for all
+// cryptographic chain/third-party verification.
+fn revocation_ids(biscuit: &Biscuit) -> Result<Vec<Vec<u8>>> {
+    use biscuit_auth::format::schema::public_key::Algorithm;
+    let container = biscuit.container().to_proto();
+    let mut signer_algorithm = Algorithm::Secp256r1; // TrustedIssuers are P-256 keys.
+    let mut identifiers = Vec::with_capacity(biscuit.block_count());
+    for block in std::iter::once(&container.authority).chain(&container.blocks) {
+        let raw = block.signature.as_slice();
+        let identifier = match signer_algorithm {
+            Algorithm::Secp256r1 => {
+                let signature =
+                    p256::ecdsa::Signature::from_der(raw).map_err(|_| AuthError::InvalidGrant)?;
+                signature
+                    .normalize_s()
+                    .unwrap_or(signature)
+                    .to_der()
+                    .as_bytes()
+                    .to_vec()
+            }
+            Algorithm::Ed25519 => raw.to_vec(),
+        };
+        identifiers.push(identifier);
+        signer_algorithm =
+            Algorithm::from_i32(block.next_key.algorithm).ok_or(AuthError::InvalidGrant)?;
+    }
+    Ok(identifiers)
 }
 pub fn verify_biscuit(
     encoded: &[u8],
@@ -201,11 +558,12 @@ pub fn verify_biscuit(
     if biscuit.block_count() > MAX_GRANT_BLOCKS {
         return Err(AuthError::InvalidGrant);
     }
-    let mut current = claims(&biscuit, 0, "authority")?;
+    let blocks = literal_blocks(&biscuit)?;
+    let mut current = read_block(&blocks[0], 0)?;
     if current.parent.is_some() || (!audience.is_empty() && current.audience != audience) {
         return Err(AuthError::Audience);
     }
-    let ids = biscuit.revocation_identifiers();
+    let ids = revocation_ids(&biscuit)?;
     let mut holders = vec![current.client.clone()];
     for index in 1..biscuit.block_count() {
         let external = biscuit
@@ -214,7 +572,7 @@ pub fn verify_biscuit(
         if external != current.client.biscuit_public()? {
             return Err(AuthError::Delegation);
         }
-        let child = claims(&biscuit, index, &external.print())?;
+        let child = read_block(&blocks[index], index)?;
         if child.parent.as_deref() != Some(ids[index - 1].as_slice())
             || child.audience != current.audience
             || child.expires > current.expires
@@ -229,7 +587,8 @@ pub fn verify_biscuit(
         issuer,
         holders,
         biscuit,
-        claims: current,
+        metadata: current,
+        blocks,
         revocation_ids: ids,
     })
 }
@@ -244,8 +603,7 @@ pub fn issue_grant(
     if audience.is_empty() || expires <= time::OffsetDateTime::now_utc().unix_timestamp() {
         return Err(AuthError::InvalidGrant);
     }
-    let claims = Claims {
-        version: 2,
+    let metadata = BlockMetadata {
         client: client.clone(),
         audience: audience.into(),
         scope: scope.clone(),
@@ -253,10 +611,7 @@ pub fn issue_grant(
         parent: None,
     };
     let biscuit = BiscuitBuilder::new()
-        .fact(fact(
-            "pki_grant",
-            &[int(0), bytes(&serde_json::to_vec(&claims)?)],
-        ))?
+        .merge(native_block(0, &metadata)?)
         .build(&issuer.biscuit_keypair()?)?;
     let grant = Grant {
         bytes: biscuit.to_vec()?,
@@ -288,21 +643,14 @@ pub fn delegate_grant(
     {
         return Err(AuthError::Delegation);
     }
-    let claims = Claims {
-        version: 2,
+    let metadata = BlockMetadata {
         client: client.clone(),
         audience: verified.audience().into(),
         scope: scope.clone(),
         expires,
         parent: verified.revocation_ids.last().cloned(),
     };
-    let block = BlockBuilder::new().fact(fact(
-        "pki_grant",
-        &[
-            int(verified.biscuit.block_count() as i64),
-            bytes(&serde_json::to_vec(&claims)?),
-        ],
-    ))?;
+    let block = native_block(verified.biscuit.block_count(), &metadata)?;
     let response = verified
         .biscuit
         .third_party_request()?
@@ -321,7 +669,7 @@ pub fn delegate_grant(
     )?;
     Ok(grant)
 }
-/// Check a collection's operation grant and expiry without evaluating checks that need
+/// Evaluate native operation, expiry and known basin checks without checks that need
 /// candidate resource facts. Call `authorize_operation` on every candidate before disclosing it.
 pub fn authorize_collection(
     capability: &VerifiedCapability,
@@ -329,15 +677,54 @@ pub fn authorize_collection(
     basin: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    let target_valid = match operation {
-        Operation::ListBasins => basin.is_none(),
-        Operation::ListStreams => basin.is_some_and(|b| capability.scope().basins.contains(b)),
-        _ => false,
-    };
-    if !target_valid || now >= capability.expires_at() || !capability.scope().permits(operation) {
+    if !matches!(
+        (operation, basin),
+        (Operation::ListBasins, None) | (Operation::ListStreams, Some(_))
+    ) {
         return Err(AuthError::PermissionDenied);
     }
+    // Collection preflight evaluates the signed profile facts and native checks.
+    // Additional arbitrary checks need each candidate's resource context and are
+    // evaluated by authorize_operation before any row or count is disclosed.
+    let mut builder = request_context(capability, operation, basin, None, now)?;
+    for (index, block) in capability.blocks.iter().enumerate() {
+        for f in block
+            .facts
+            .iter()
+            .filter(|f| f.predicate.name.starts_with("pki_"))
+        {
+            builder = builder.fact(f.clone())?;
+        }
+        builder = builder.merge_block(required_checks(index)?);
+    }
+    builder
+        .code(ALLOW_POLICY)?
+        .build_unauthenticated()?
+        .authorize()?;
     Ok(())
+}
+
+fn request_context(
+    capability: &VerifiedCapability,
+    operation: Operation,
+    basin: Option<&str>,
+    stream: Option<&str>,
+    now: i64,
+) -> Result<AuthorizerBuilder> {
+    let mut builder = AuthorizerBuilder::new()
+        .set_limits(limits())
+        .fact(fact("time", &[int(now)]))?
+        .fact(fact("operation", &[string(&format!("{operation:?}"))]))?
+        .fact(fact("audience", &[string(capability.audience())]))?
+        .fact(fact("basin_present", &[boolean(basin.is_some())]))?
+        .fact(fact("stream_present", &[boolean(stream.is_some())]))?;
+    if let Some(b) = basin {
+        builder = builder.fact(fact("basin", &[string(b)]))?;
+    }
+    if let Some(s) = stream {
+        builder = builder.fact(fact("stream", &[string(s)]))?;
+    }
+    Ok(builder)
 }
 
 pub fn authorize_operation(
@@ -382,25 +769,8 @@ pub fn authorize_operation(
     if (basin_required && basin.is_none()) || (stream_required && stream.is_none()) {
         return Err(AuthError::PermissionDenied);
     }
-    if now >= capability.expires_at()
-        || !capability.scope().permits(operation)
-        || basin.is_some_and(|b| !capability.scope().basins.contains(b))
-        || stream.is_some_and(|s| !capability.scope().streams.contains(s))
-    {
-        return Err(AuthError::PermissionDenied);
-    }
-    let mut builder = AuthorizerBuilder::new()
-        .set_limits(limits())
-        .fact(fact("time", &[int(now)]))?
-        .fact(fact("operation", &[string(&format!("{operation:?}"))]))?;
-    if let Some(b) = basin {
-        builder = builder.fact(fact("basin", &[string(b)]))?;
-    }
-    if let Some(s) = stream {
-        builder = builder.fact(fact("stream", &[string(s)]))?;
-    }
-    builder
-        .code("allow if true")?
+    request_context(capability, operation, basin, stream, now)?
+        .code(ALLOW_POLICY)?
         .build(&capability.biscuit)?
         .authorize()?;
     Ok(())

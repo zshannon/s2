@@ -54,7 +54,7 @@ pub enum PkiCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Verify and inspect a grant's issuer, holder, scope, expiry and revocation ancestry.
+    /// Verify and inspect a grant's native Datalog blocks and delegation metadata.
     Inspect {
         #[arg(long)]
         grant_file: PathBuf,
@@ -235,7 +235,7 @@ pub async fn run(command: &PkiCommand) -> Result<(), CliError> {
                 "",
             )
             .map_err(err)?;
-            println!("{}",serde_json::to_string_pretty(&serde_json::json!({"issuer":grant.issuer(),"client":verified.client_public_key(),"audience":verified.audience(),"expires_at":verified.expires_at(),"scope":verified.scope(),"blocks":verified.revocation_identifiers().len()})).map_err(err)?)
+            println!("{}",serde_json::to_string_pretty(&serde_json::json!({"issuer":grant.issuer(),"client":verified.client_public_key(),"audience":verified.audience(),"expires_at":verified.expires_at(),"scope":verified.scope(),"blocks":verified.revocation_identifiers().len(),"datalog_blocks":verified.datalog_blocks().map_err(err)?})).map_err(err)?)
         }
         PkiCommand::Set {
             key_file,

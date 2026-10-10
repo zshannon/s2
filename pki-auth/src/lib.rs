@@ -24,8 +24,6 @@ pub enum AuthError {
     Signature,
     #[error("Biscuit verification failed: {0}")]
     Biscuit(#[from] biscuit_auth::error::Token),
-    #[error("invalid grant claims: {0}")]
-    Claims(#[from] serde_json::Error),
 }
 
 mod signatures;

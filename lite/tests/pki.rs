@@ -566,7 +566,7 @@ fn grant_with_check(
 ) -> Grant {
     use biscuit_auth::{
         Biscuit, PrivateKey, PublicKey,
-        builder::{Algorithm, BlockBuilder, bytes, fact, int},
+        builder::{Algorithm, BlockBuilder},
     };
     let public = |key: &ClientPublicKey| {
         PublicKey::from_bytes(
@@ -577,9 +577,10 @@ fn grant_with_check(
     };
     let root = issue_grant(issuer, &holder.public_key(), audience, scope, 2_000_000_000).unwrap();
     let token = Biscuit::from(&*root, public(&issuer.public_key())).unwrap();
-    let payload = serde_json::to_vec(&serde_json::json!({"version":2,"client":holder.public_key(),"audience":audience,"scope":scope,"expires":2_000_000_000i64,"parent":token.revocation_identifiers()[0]})).unwrap();
+    let restricted = s2_pki_auth::restrict_grant(&root, holder, scope, 2_000_000_000).unwrap();
+    let restricted = Biscuit::from(&*restricted, public(&issuer.public_key())).unwrap();
     let block = BlockBuilder::new()
-        .fact(fact("pki_grant", &[int(1), bytes(&payload)]))
+        .code(restricted.print_block_source(1).unwrap())
         .unwrap()
         .code(check)
         .unwrap();
