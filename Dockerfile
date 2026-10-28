@@ -1,7 +1,11 @@
 # Build stage
-FROM reg.mini.dev/rust:latest AS builder
+FROM rust:1.99.1-trixie@sha256:542d25b2363937f9b513c6c7883a0f18b88b97c3e4c68aba9d8c0f9b6fdc2d63 AS builder
 
 USER root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends clang cmake protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
