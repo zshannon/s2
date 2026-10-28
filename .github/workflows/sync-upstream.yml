@@ -1,6 +1,11 @@
 name: Sync upstream main
 
 on:
+  pull_request:
+    paths:
+      - ".github/scripts/sync-upstream.cjs"
+      - ".github/scripts/test-sync-upstream.cjs"
+      - ".github/workflows/sync-upstream.yml"
   schedule:
     - cron: "0 9 * * 2"
       timezone: America/Los_Angeles
@@ -8,52 +13,45 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
-  group: sync-upstream-main
+  group: sync-upstream-main-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  open-pull-request:
-    if: github.repository == 'zshannon/s2' && github.ref == 'refs/heads/main'
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Open or reuse upstream pull request
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Test upstream proposal state transitions
+        env:
+          TEST_REPO: ${{ github.event.repository.name }}
+        run: node --test .github/scripts/test-sync-upstream.cjs
+
+  open-pull-request:
+    if: github.event_name != 'pull_request' && github.repository == 'zshannon/s2' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the scoped upstream credential
+        env:
+          UPSTREAM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$UPSTREAM_SYNC_TOKEN" ]; then
+            echo "::error::Configure UPSTREAM_SYNC_TOKEN before enabling this workflow; see .github/UPSTREAM_SYNC.md."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Open or update an editable draft proposal
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
           script: |
-            const { owner, repo } = context.repo;
-            const base = 'main';
-            const head = 's2-streamstore:main';
-            const comparison = await github.rest.repos.compareCommitsWithBasehead({
-              owner, repo, basehead: `${base}...${head}`, per_page: 1,
-            });
-            if (comparison.data.ahead_by === 0) {
-              core.info('No upstream commits need merging.');
-              return;
-            }
-
-            const open = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', base, head, per_page: 100,
-            });
-            const existing = open.find(pr => pr.head.repo?.full_name === 's2-streamstore/s2');
-            if (existing) {
-              core.info(`Upstream pull request already open: ${existing.html_url}`);
-              return;
-            }
-
-            const { data: pr } = await github.rest.pulls.create({
-              owner, repo, base, head,
-              title: 'chore(upstream): merge upstream main',
-              body: [
-                'Merge the latest `s2-streamstore/s2:main` changes into this fork.',
-                '',
-                'Opened by the Tuesday 09:00 America/Los_Angeles sync. This PR tracks upstream main directly and is reused while open; the workflow never resets main or merges automatically.',
-                '',
-                'Use a merge commit to retain upstream ancestry, so later syncs contain only new upstream commits. Resolve any conflicts against the fork before merging.',
-              ].join('\n'),
-              maintainer_can_modify: false,
-            });
-            core.info(`Opened upstream pull request: ${pr.html_url}`);
+            const syncUpstream = require('./.github/scripts/sync-upstream.cjs');
+            await syncUpstream({ context, core, github });

@@ -73,6 +73,7 @@ jobs:
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: ${{ matrix.sdk.go-version }}
+          go-version-file: sdk/go.mod
           cache-dependency-path: sdk/go.sum
 
       - name: Setup uv
