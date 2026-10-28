@@ -55,6 +55,23 @@ fork's PKI behavior and its deployment/package-release configuration. For the
 TypeScript SDK, also retain the published Biscuit dependency and `@zshannon`
 package names.
 
+Choose an unused local branch and worktree path. Replace `REPLACE_WITH_SHA`
+with the initial SHA in the proposal's branch name (copy the branch from the PR):
+
+```sh
+git fetch origin main automation/upstream-REPLACE_WITH_SHA
+git worktree add -b sync/upstream-review ../upstream-integration origin/automation/upstream-REPLACE_WITH_SHA
+cd ../upstream-integration
+git merge --no-ff origin/main
+```
+
+Resolve conflicts, stage the resolved files, and complete the merge with
+`git commit`. Push back to the same proposal branch, replacing the same placeholder:
+
+```sh
+git push origin HEAD:automation/upstream-REPLACE_WITH_SHA
+```
+
 Review workflow changes before approving any approval-required runs. Wait for
 required checks, mark the PR ready, and merge using a **merge commit**. Squashing
 or rebasing upstream imports loses the ancestry used to identify new changes.

@@ -20,6 +20,6 @@ jobs:
           persist-credentials: false
       - name: Check Rust dependency cooldown
         if: github.event_name == 'pull_request'
-        uses: $/.github/actions/rust-dependency-cooldown
+        uses: ./.github/actions/rust-dependency-cooldown
         with:
           base-sha: HEAD^1
